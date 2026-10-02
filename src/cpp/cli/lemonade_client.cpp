@@ -798,6 +798,8 @@ std::vector<ModelInfo> LemonadeClient::get_models(bool show_all) const {
             if (model_item.contains("downloaded") && model_item["downloaded"].is_boolean()) {
                 info.downloaded = model_item["downloaded"].get<bool>();
             }
+            info.cold = model_item.value("cold", false);
+            info.cold_available = model_item.value("cold_available", true);
 
             if (model_item.contains("suggested") && model_item["suggested"].is_boolean()) {
                 info.suggested = model_item["suggested"].get<bool>();
@@ -880,6 +882,9 @@ int LemonadeClient::list_models(bool show_all, const std::string& name_filter) c
             // column is always copy-paste-safe.
             for (const auto& model : models) {
                 std::string downloaded = model.downloaded ? "Yes" : "No";
+                if (model.cold) {
+                    downloaded = model.cold_available ? "Cold" : "Cold (offline)";
+                }
                 std::string details = model.recipe.empty() ? "-" : model.recipe;
                 std::cout   << std::left << std::setw(40) << model.id
                             << std::setw(15) << downloaded;
@@ -898,7 +903,7 @@ int LemonadeClient::list_models(bool show_all, const std::string& name_filter) c
         std::vector<ModelInfo> local_models;
         std::vector<ModelInfo> available_models;
         for (const auto& model : models) {
-            if (model.downloaded) {
+            if (model.downloaded || model.cold) {
                 local_models.push_back(model);
             } else {
                 available_models.push_back(model);
@@ -1145,6 +1150,95 @@ int LemonadeClient::delete_model(const std::string& model_name) const {
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "Error deleting model: " << e.what() << std::endl;
+        return 1;
+    }
+}
+
+int LemonadeClient::transfer_cold_model(const std::string& model_name, bool freeze) {
+    const char* verb = freeze ? "Moving to cold storage" : "Restoring from cold storage";
+    const char* noun = freeze ? "moving model to cold storage" : "restoring model from cold storage";
+    std::cout << verb << ": " << model_name << std::endl;
+    try {
+        json request_body = {{"model_name", model_name}, {"stream", true}};
+        StreamingRequestState state;
+        make_request(freeze ? "/api/v1/freeze" : "/api/v1/thaw", "POST", request_body.dump(),
+                     "application/json",
+        [&](const std::string& event_type, const std::string& event_data) {
+            if (event_type == "complete") {
+                std::cout << std::endl;
+                state.success = true;
+            } else if (event_type == "error") {
+                try {
+                    auto error_json = json::parse(event_data);
+                    state.error_message = error_json.value("error", event_data);
+                } catch (...) {
+                    state.error_message = event_data;
+                }
+            } else {
+                parse_sse_progress(event_data, state);
+            }
+        }, LONG_TIMEOUT_MS, LONG_TIMEOUT_MS);
+
+        if (!state.success) {
+            throw std::runtime_error(state.error_message.empty() ? "Transfer failed" : state.error_message);
+        }
+        std::cout << (freeze ? "Model moved to cold storage: " : "Model restored from cold storage: ")
+                  << model_name << std::endl;
+        return 0;
+    } catch (const HttpError& e) {
+        std::cerr << "Error " << noun << ": " << extract_server_error_message(e) << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Error " << noun << ": " << e.what() << std::endl;
+        return 1;
+    }
+}
+
+static void print_cold_storage_status(const json& status) {
+    if (!status.value("enabled", false)) {
+        std::cout << "Cold storage is not configured." << std::endl;
+        std::cout << "Enable it with: lemonade config set cold_storage_dir=/path/to/drive" << std::endl;
+        return;
+    }
+    std::cout << "Cold storage: " << status.value("dir", "") << std::endl;
+    if (status.value("available", false)) {
+        const double free_gb = status.value("free_bytes", (uint64_t)0) / (1024.0 * 1024.0 * 1024.0);
+        std::cout << "Status:       available (" << std::fixed << std::setprecision(1)
+                  << free_gb << " GB free)" << std::endl;
+    } else {
+        std::cout << "Status:       unavailable (" << status.value("reason", "") << ")" << std::endl;
+        if (status.contains("message")) {
+            std::cout << status.value("message", "") << std::endl;
+        }
+    }
+}
+
+int LemonadeClient::cold_storage_status() const {
+    try {
+        std::string response = make_request("/api/v1/cold-storage/status?refresh=true", "GET");
+        print_cold_storage_status(json::parse(response));
+        return 0;
+    } catch (const HttpError& e) {
+        std::cerr << "Error getting cold storage status: " << extract_server_error_message(e) << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Error getting cold storage status: " << e.what() << std::endl;
+        return 1;
+    }
+}
+
+int LemonadeClient::cold_storage_adopt(bool create_marker) const {
+    try {
+        json request_body = {{"create_marker", create_marker}};
+        std::string response = make_request("/internal/cold-storage/adopt", "POST",
+                                            request_body.dump(), "application/json");
+        print_cold_storage_status(json::parse(response));
+        return 0;
+    } catch (const HttpError& e) {
+        std::cerr << "Error adopting cold storage: " << extract_server_error_message(e) << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Error adopting cold storage: " << e.what() << std::endl;
         return 1;
     }
 }

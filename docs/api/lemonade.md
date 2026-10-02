@@ -17,6 +17,10 @@ We have designed a set of Lemonade-specific endpoints to enable client applicati
 | `GET` | [`/v1/registry/search`](#get-v1registrysearch) | Search Hugging Face or ModelScope for model repositories |
 | `GET` | [`/v1/pull/variants`](#get-v1pullvariants) | Enumerate GGUF variants for a Hugging Face checkpoint |
 | `POST` | [`/v1/delete`](#post-v1delete) | Delete a model |
+| `POST` | [`/v1/freeze`](#post-v1freeze) | Move a downloaded model to cold storage |
+| `POST` | [`/v1/thaw`](#post-v1thaw) | Move a model back from cold storage |
+| `GET` | [`/v1/cold-storage/status`](#get-v1cold-storagestatus) | Check whether the cold storage drive is available |
+| `POST` | [`/internal/cold-storage/adopt`](#post-internalcold-storageadopt) | Use the drive currently at `cold_storage_dir` as cold storage |
 | `POST` | [`/v1/load`](#post-v1load) | Load a model |
 | `POST` | [`/v1/unload`](#post-v1unload) | Unload a model |
 | `POST` | [`/v1/audio/generations`](#post-v1audiogenerations) | Generate audio (music or sound effects) from a text prompt |
@@ -1115,6 +1119,70 @@ Response format:
 ```
 
 In case of an error, the status will be `error` and the message will contain the error message.
+
+## Cold storage
+
+Cold storage lets a large, slower disk (a NAS share or a big USB drive) hold downloaded models that are not needed right now, freeing space in the models directory. It is off unless `cold_storage_dir` is set in [`config.json`](../guide/configuration/README.md); while it is off, the endpoints below return `400` with `"code": "cold_storage_disabled"` and nothing else changes.
+
+- A model in cold storage stays listed. `GET /v1/models` reports it with `"downloaded": false` and `"cold": true`, plus `"cold_available": false` when the drive is missing. Models that are not in cold storage have no `cold` key.
+- Loading or pulling a cold model moves it back first, so `/v1/load`, chat requests that auto-load, and `/v1/pull` all work unchanged. A pull of a cold model restores it even in offline mode and does not check for updates; pull again afterwards to update it.
+- Deleting a cold model also deletes its cold storage copy.
+- Repositories that another downloaded model still needs (for example a shared `mmproj`) are copied rather than moved.
+- FastFlowLM, cloud, `extra_models_dir`, locally imported models, and collections cannot be moved. Move a collection's component models instead.
+
+**Drive identity.** Setting `cold_storage_dir` writes `.lemonade-cold-storage.json` (holding a random id) into that directory and stores the same id as `cold_storage_id`. If the directory already has the file, its id is reused, which is how an existing drive is reattached. A missing directory is never created. Before every move the server checks that the file is present and the id matches; if not (drive unmounted, or a different drive at the same path), cold storage is reported unavailable and nothing is written there. Loading a cold model then fails with `503` and `"code": "cold_storage_unavailable"` instead of downloading it again.
+
+## `POST /v1/freeze`
+<sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>
+
+Move a downloaded model to cold storage. A loaded model is unloaded first.
+
+### Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `model_name` | Yes | Model to move. |
+| `stream` | No | Same streaming modes as [`/v1/pull`](#post-v1pull): `true` streams SSE progress, and with `"subscribe": false` the move runs as a server-owned job under id `cold:<model_name>` in [`/v1/downloads`](#get-v1downloads). Progress events carry `"operation": "freeze"`. Jobs can be cancelled but not paused; a cancelled move leaves the files where they were. |
+
+```bash
+curl -X POST http://localhost:13305/v1/freeze \
+  -H "Content-Type: application/json" \
+  -d '{"model_name": "Qwen3-0.6B-GGUF"}'
+```
+
+```json
+{"status": "success", "model_name": "Qwen3-0.6B-GGUF"}
+```
+
+Errors: `400` with `code` `cold_storage_disabled` or `not_freezable` (with the reason), `404` for an unknown model, `409` if the model is already being moved, `503` with `cold_storage_unavailable`.
+
+## `POST /v1/thaw`
+<sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>
+
+Move a model back from cold storage. Takes the same parameters as [`/v1/freeze`](#post-v1freeze); the server-owned job id is `model:<model_name>` (shared with `/v1/pull`) and progress events carry `"operation": "thaw"`. Returns `400` with `"code": "not_cold"` for a model that is not in cold storage.
+
+## `GET /v1/cold-storage/status`
+<sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>
+
+Report whether cold storage is configured and usable. The check is cached for a few seconds and times out after a few seconds on an unresponsive network mount; pass `?refresh=true` to re-check now.
+
+```json
+{
+  "enabled": true,
+  "available": false,
+  "reason": "marker_missing",
+  "dir": "/mnt/nas/lemonade-cold",
+  "id": "3f9c0b2a7d1e4c58a6b0f2d9e8c7b6a5",
+  "message": "Cold storage directory '/mnt/nas/lemonade-cold' has no Lemonade marker file (wrong drive, or not mounted?). Run `lemonade cold-storage adopt` if this is intended",
+  "busy": false
+}
+```
+
+`reason` is one of `ok`, `not_configured`, `not_initialized` (directory set but no id yet), `directory_missing`, `marker_missing`, `id_mismatch`, `io_error`, or `timeout`. `free_bytes` is included when the drive is available.
+
+## `POST /internal/cold-storage/adopt`
+
+Use the drive currently mounted at `cold_storage_dir`: reads its marker file and stores that id as `cold_storage_id`. With `{"create_marker": true}`, a directory without a marker is initialized as a new cold storage drive. Models moved to a different drive show as not downloaded until that drive is adopted again. Returns the same body as `GET /v1/cold-storage/status`.
 
 ## `POST /v1/load`
 <sub>![Status](https://img.shields.io/badge/status-fully_available-green)</sub>

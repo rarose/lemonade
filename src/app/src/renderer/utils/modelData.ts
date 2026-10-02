@@ -31,6 +31,10 @@ export interface ModelInfo {
   reasoning?: boolean;
   vision?: boolean;
   downloaded?: boolean;
+  // Files are in cold storage; loading moves them back first.
+  cold?: boolean;
+  // False when the cold storage drive is missing or not the expected one.
+  cold_available?: boolean;
   update_available?: boolean;
   image_defaults?: ImageDefaults;
   // Per-collection system prompt template (collection.omni only). Overrides the
@@ -197,6 +201,11 @@ const fetchBuiltInModelsFromAPI = async (): Promise<ModelsData> => {
         downloaded: model.downloaded || false,
         update_available: model.update_available === true,
       };
+
+      if (model.cold === true) {
+        modelInfo.cold = true;
+        modelInfo.cold_available = model.cold_available !== false;
+      }
 
       if (Array.isArray(model.labels)) {
         modelInfo.labels = model.labels;

@@ -119,6 +119,28 @@ static void validate_extra_models_dir_access(const std::string& raw_dir) {
     }
 }
 
+// Deliberately no existence check: an unmounted drive must still be configurable,
+// and ColdStorage reports it as unavailable instead.
+static void validate_cold_storage_dir(const std::string& raw_dir) {
+    if (raw_dir.empty()) {
+        return;
+    }
+    const fs::path dir = utils::path_from_utf8(raw_dir);
+    if (!dir.is_absolute()) {
+        throw std::invalid_argument("'cold_storage_dir' must be an absolute path: " + raw_dir);
+    }
+    const fs::path cold = dir.lexically_normal();
+    const fs::path hot = utils::path_from_utf8(utils::get_hf_cache_dir()).lexically_normal();
+    auto is_within = [](const fs::path& inner, const fs::path& outer) {
+        const std::string rel = utils::path_to_utf8(inner.lexically_relative(outer));
+        return !rel.empty() && rel.rfind("..", 0) != 0;
+    };
+    if (is_within(cold, hot) || is_within(hot, cold)) {
+        throw std::invalid_argument(
+            "'cold_storage_dir' must not overlap the models directory: " + raw_dir);
+    }
+}
+
 static std::pair<json, std::string> normalize_config_set_changes(const json& changes) {
     json normalized = changes;
     std::string message;
@@ -408,6 +430,16 @@ void RuntimeConfig::set_log_max_files_override(std::optional<int> override_val) 
 std::string RuntimeConfig::extra_models_dir() const {
     std::shared_lock lock(mutex_);
     return config_["extra_models_dir"].get<std::string>();
+}
+
+std::string RuntimeConfig::cold_storage_dir() const {
+    std::shared_lock lock(mutex_);
+    return config_.value("cold_storage_dir", std::string());
+}
+
+std::string RuntimeConfig::cold_storage_id() const {
+    std::shared_lock lock(mutex_);
+    return config_.value("cold_storage_id", std::string());
 }
 
 bool RuntimeConfig::broadcast() const {
@@ -866,6 +898,23 @@ void RuntimeConfig::validate(const std::string& key, const json& value) const {
         }
         if (key == "extra_models_dir") {
             validate_extra_models_dir_access(value.get<std::string>());
+        }
+    } else if (key == "cold_storage_dir") {
+        if (!value.is_string()) {
+            throw std::invalid_argument("'cold_storage_dir' must be a string");
+        }
+        validate_cold_storage_dir(value.get<std::string>());
+    } else if (key == "cold_storage_id") {
+        if (!value.is_string()) {
+            throw std::invalid_argument("'cold_storage_id' must be a string");
+        }
+        const std::string id = value.get<std::string>();
+        const bool valid_hex = id.size() == 32 &&
+            std::all_of(id.begin(), id.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            });
+        if (!id.empty() && !valid_hex) {
+            throw std::invalid_argument("'cold_storage_id' must be empty or 32 lowercase hex characters");
         }
     } else if (key == "default_model_source") {
         if (!value.is_string()) {

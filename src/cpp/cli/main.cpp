@@ -1323,6 +1323,12 @@ int main(int argc, char* argv[]) {
     CLI::App* pull_cmd = app.add_subcommand("pull",
         "Pull/download a model by registered name or remote registry checkpoint")->group("Model management");
     CLI::App* delete_cmd = app.add_subcommand("delete", "Delete a model")->group("Model management");
+    CLI::App* freeze_cmd = app.add_subcommand("freeze", "Move a downloaded model to cold storage")->group("Model management");
+    CLI::App* thaw_cmd = app.add_subcommand("thaw", "Move a model back from cold storage")->group("Model management");
+    CLI::App* cold_cmd = app.add_subcommand("cold-storage", "Show or adopt the cold storage drive")->group("Model management");
+    CLI::App* cold_status_cmd = cold_cmd->add_subcommand("status", "Show cold storage status")->group("Subcommands");
+    CLI::App* cold_adopt_cmd = cold_cmd->add_subcommand("adopt",
+        "Use the drive currently mounted at cold_storage_dir as cold storage")->group("Subcommands");
     CLI::App* load_cmd = app.add_subcommand("load", "Load a model")->group("Model management");
     CLI::App* unload_cmd = app.add_subcommand("unload", "Unload a model (or all models)")->group("Model management");
     CLI::App* pin_cmd = app.add_subcommand("pin", "Pin a loaded model to prevent eviction")->group("Model management");
@@ -1454,6 +1460,13 @@ int main(int argc, char* argv[]) {
 
     // Delete options
     delete_cmd->add_option("model", config.model, "Model name to delete")->required()->type_name("MODEL");
+
+    // Cold storage options
+    static bool cold_create_marker = false;
+    freeze_cmd->add_option("model", config.model, "Model name to move to cold storage")->required()->type_name("MODEL");
+    thaw_cmd->add_option("model", config.model, "Model name to move back from cold storage")->required()->type_name("MODEL");
+    cold_adopt_cmd->add_flag("--create-marker", cold_create_marker,
+        "Initialize the directory as a new cold storage drive if it has no marker file");
 
     // Load options
     static bool load_pinned_flag = false;
@@ -1625,6 +1638,15 @@ int main(int argc, char* argv[]) {
         return handle_import_command(client, config);
     } else if (delete_cmd->count() > 0) {
         return client.delete_model(config.model);
+    } else if (freeze_cmd->count() > 0) {
+        return client.transfer_cold_model(config.model, true);
+    } else if (thaw_cmd->count() > 0) {
+        return client.transfer_cold_model(config.model, false);
+    } else if (cold_cmd->count() > 0) {
+        if (cold_adopt_cmd->count() > 0) {
+            return client.cold_storage_adopt(cold_create_marker);
+        }
+        return client.cold_storage_status();
     } else if (run_cmd->count() > 0) {
         return handle_run_command(client, config);
     } else if (chat_cmd->count() > 0) {

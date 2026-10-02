@@ -13,6 +13,8 @@
   "auto_update_models": false,
   "broadcast": true,
   "cloud_providers": [],
+  "cold_storage_dir": "",
+  "cold_storage_id": "",
   "config_version": 2,
   "ctx_size": -1,
   "default_model_source": "huggingface",

@@ -1249,6 +1249,78 @@ sys.exit(0)
     # Run Tests
     # =============================================================================
 
+    def test_092a_cold_storage_cycle(self):
+        """Freeze, restore on pull, refuse a different drive, adopt, delete, disable."""
+        model = ENDPOINT_TEST_MODEL
+        cold_dir = tempfile.mkdtemp(prefix="lemonade-cold-")
+        marker = os.path.join(cold_dir, ".lemonade-cold-storage.json")
+        api = f"http://localhost:{PORT}/api/v1"
+
+        def model_entry():
+            models = requests.get(
+                f"{api}/models", headers=_auth_headers(), timeout=TIMEOUT_DEFAULT
+            ).json()["data"]
+            return next((m for m in models if m["id"] == model), None)
+
+        def cold_repos():
+            return [n for n in os.listdir(cold_dir) if n.startswith("models--")]
+
+        try:
+            self.assertCommandSucceeds(["pull", model], timeout=TIMEOUT_MODEL_OPERATION)
+            set_server_config({"cold_storage_dir": cold_dir})
+            self.assertTrue(os.path.exists(marker), "marker file should be written")
+
+            self.assertCommandSucceeds(
+                ["freeze", model], timeout=TIMEOUT_MODEL_OPERATION
+            )
+            self.assertTrue(cold_repos())
+            entry = model_entry()
+            self.assertIsNotNone(entry, "cold models stay in /models")
+            self.assertTrue(entry.get("cold"))
+            self.assertFalse(entry["downloaded"])
+            listing = self.assertCommandSucceeds(["list", "--downloaded"]).stdout
+            self.assertIn("Cold", listing)
+
+            self.assertCommandSucceeds(["pull", model], timeout=TIMEOUT_MODEL_OPERATION)
+            entry = model_entry()
+            self.assertTrue(entry["downloaded"])
+            self.assertNotIn("cold", entry)
+            self.assertFalse(cold_repos())
+
+            self.assertCommandSucceeds(
+                ["freeze", model], timeout=TIMEOUT_MODEL_OPERATION
+            )
+            with open(marker, encoding="utf-8") as f:
+                original_marker = f.read()
+            with open(marker, "w", encoding="utf-8") as f:
+                json.dump({"id": "a" * 32}, f)
+            status = requests.get(
+                f"{api}/cold-storage/status?refresh=true",
+                headers=_auth_headers(),
+                timeout=TIMEOUT_DEFAULT,
+            ).json()
+            self.assertEqual(status["reason"], "id_mismatch")
+            load = requests.post(
+                f"{api}/load",
+                json={"model_name": model},
+                headers=_auth_headers(),
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(load.status_code, 503, load.text)
+            self.assertTrue(cold_repos(), "an unavailable drive must not be touched")
+
+            with open(marker, "w", encoding="utf-8") as f:
+                f.write(original_marker)
+            self.assertCommandSucceeds(["cold-storage", "adopt"])
+
+            self.assertCommandSucceeds(["delete", model])
+            self.assertFalse(cold_repos(), "delete removes the cold copy")
+            print("[OK] cold storage freeze/restore/identity/delete cycle")
+        finally:
+            set_server_config({"cold_storage_dir": ""})
+            shutil.rmtree(cold_dir, ignore_errors=True)
+            run_cli_command(["pull", model], timeout=TIMEOUT_MODEL_OPERATION)
+
     def test_100_run_with_model(self):
         """Test run command with explicit model."""
         with tempfile.TemporaryDirectory(prefix="lemonade-open-stub-") as temp_dir:

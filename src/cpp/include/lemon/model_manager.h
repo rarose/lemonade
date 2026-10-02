@@ -15,6 +15,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "canonical_id.h"
+#include "cold_storage.h"
 #include "directory_watcher.h"
 #include "gguf_reader.h"
 #include "model_registry.h"
@@ -67,6 +68,7 @@ struct DownloadProgress {
     int percent = 0;            // Overall percentage (0-100)
     bool complete = false;      // True when all downloads finished
     std::string error;          // Error message if failed
+    std::string operation;      // Empty for downloads; "freeze"/"thaw" for cold storage moves
 };
 
 // Callback for download progress updates
@@ -103,6 +105,7 @@ struct ModelInfo {
     std::string registry_source;  // Remote registry: huggingface/modelscope; empty when unpinned
     bool downloaded = false;     // Whether model is downloaded and available
     bool update_available = false; // Whether a newer remote-registry version exists
+    bool cold = false;           // Files live in cold storage; loading moves them back first
     std::optional<bool> auto_update = std::nullopt; // Optional per-model auto-update override
     double size = 0.0;   // Model size in GB
     // Resident working set for a streaming backend; 0 = filter on full `size`.
@@ -464,6 +467,24 @@ struct UpdateCheckResult {
 
     void start_directory_watcher();
 
+    // Cold storage. Every entry point is a no-op (or a ColdStorageRequestError
+    // for explicit freeze requests) while cold_storage_dir is empty.
+    void configure_cold_storage(const std::string& dir, const std::string& id);
+    bool cold_storage_enabled() const;
+    ColdStorageStatus cold_storage_status(bool force = false);
+    // Empty when the model can be frozen, otherwise a user-facing reason.
+    std::string cold_freeze_eligibility(const ModelInfo& info);
+    bool is_model_cold(const std::string& model_name);
+    bool cold_storage_busy() const;
+    // Marks the model as mid-transfer so concurrent loads wait for the transfer
+    // instead of reading files that are being moved. False if already marked.
+    bool begin_cold_transfer(const std::string& model_name);
+    void end_cold_transfer(const std::string& model_name);
+    void freeze_model(const std::string& model_name, DownloadProgressCallback progress_callback = nullptr);
+    // Moves a cold model back to the models directory. Returns false when the
+    // model was not in cold storage, so the caller should download it normally.
+    bool thaw_model(const ModelInfo& info, DownloadProgressCallback progress_callback = nullptr);
+
 private:
     // Cycle-detecting overload used by the collection fan-out in download_model.
     // `visited` accumulates collection names already entered on the current
@@ -535,6 +556,18 @@ private:
     void update_model_options_in_cache_locked(const ModelInfo& info);
     void update_model_in_cache(const std::string& model_name, bool downloaded);
     void remove_model_from_cache(const std::string& model_name);
+    void set_model_cold_in_cache(const std::string& model_name, bool cold);
+
+    struct ColdRepo {
+        std::string lock_key;
+        std::string dir_name;
+        bool is_main = false;
+    };
+    std::vector<ColdRepo> cold_model_repos(const ModelInfo& info) const;
+    std::vector<std::unique_lock<std::mutex>> lock_model_repos(const std::vector<ColdRepo>& repos);
+    bool repo_used_by_other_hot_model(const std::string& dir_name, const std::string& exclude_model);
+    void delete_cold_copy(const ModelInfo& info);
+    void sweep_cold_staging_if_idle();
 
     // Resolve model checkpoint to absolute path on disk
     std::string resolve_model_path(const ModelInfo& info, const std::string& type, const std::string& checkpoint) const;
@@ -567,6 +600,7 @@ private:
     CloudProviderRegistry* cloud_registry_ = nullptr;  // Not owned
     std::function<std::string()> default_model_source_provider_;
     std::unique_ptr<DirectoryWatcher> directory_watcher_;
+    std::unique_ptr<ColdStorage> cold_storage_;
 
     // Fired after the model registry changes (add/edit/remove). Guarded by its
     // own mutex; invoked outside all other ModelManager locks.

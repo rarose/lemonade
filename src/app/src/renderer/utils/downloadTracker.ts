@@ -5,9 +5,13 @@ const ACTIVE_SERVER_DOWNLOAD_POLL_INTERVAL_MS = 2000;
 const TERMINAL_DOWNLOAD_VISIBILITY_MS = 30000;
 const SPEED_SMOOTHING_ALPHA = 0.35;
 
+export type DownloadKind = 'model' | 'backend' | 'cold';
+export type ColdOperation = 'freeze' | 'thaw';
+
 export interface DownloadProgressEvent {
   id?: string;
-  type?: 'model' | 'backend';
+  type?: DownloadKind;
+  operation?: ColdOperation;
   model_name?: string;
   status?: DownloadItem['status'];
   running?: boolean;
@@ -60,8 +64,8 @@ class DownloadTracker {
     }
   }
 
-  getStableDownloadId(modelName: string, downloadType?: 'model' | 'backend'): string {
-    return `${downloadType === 'backend' ? 'backend' : 'model'}:${modelName}`;
+  getStableDownloadId(modelName: string, downloadType?: DownloadKind): string {
+    return `${downloadType === 'backend' || downloadType === 'cold' ? downloadType : 'model'}:${modelName}`;
   }
 
   /**
@@ -70,7 +74,7 @@ class DownloadTracker {
   startDownload(
     modelName: string,
     abortController: AbortController,
-    downloadType?: 'model' | 'backend',
+    downloadType?: DownloadKind,
     collectionComponents?: string[],
     declaredTotalBytes?: number,
   ): string {
@@ -90,7 +94,8 @@ class DownloadTracker {
       }
     }
 
-    const downloadId = downloadType === 'model' || downloadType === 'backend'
+    const serverTracked = downloadType === 'model' || downloadType === 'backend' || downloadType === 'cold';
+    const downloadId = serverTracked
       ? this.getStableDownloadId(modelName, downloadType)
       : `${modelName}-${Date.now()}`;
 
@@ -111,7 +116,8 @@ class DownloadTracker {
       collectionComponents,
       declaredTotalBytes,
       bytesTotalIsLowerBound: false,
-      running: downloadType === 'model' || downloadType === 'backend' ? true : undefined,
+      running: serverTracked ? true : undefined,
+      operation: downloadType === 'cold' ? 'freeze' : undefined,
       speedBytesPerSecond: 0,
       speedSampleTime: Date.now(),
       speedSampleBytes: 0,
@@ -295,6 +301,7 @@ class DownloadTracker {
       status: progress.status ?? download.status,
       running: progress.running ?? download.running,
       error: progress.error ?? download.error,
+      operation: progress.operation ?? download.operation,
       abortController: shouldReleaseLocalOwner ? undefined : download.abortController,
       updatedAt: Date.now(),
     };
@@ -619,7 +626,8 @@ class DownloadTracker {
 
   private emitModelsUpdatedOnce(downloadId: string, progress: DownloadProgressEvent): void {
     const downloadType = progress.type ?? this.activeDownloads.get(downloadId)?.downloadType;
-    if (downloadType !== 'model' || this.completedModelDownloadsNotified.has(downloadId)) return;
+    if ((downloadType !== 'model' && downloadType !== 'cold') ||
+        this.completedModelDownloadsNotified.has(downloadId)) return;
 
     this.completedModelDownloadsNotified.add(downloadId);
     window.dispatchEvent(new CustomEvent('modelsUpdated'));
@@ -652,6 +660,7 @@ class DownloadTracker {
       startTime: Date.now(),
       bytesResumed: restoredBytesDownloaded,
       downloadType: progress.type,
+      operation: progress.operation,
       running: progress.running,
       speedBytesPerSecond: 0,
       speedSampleTime: Date.now(),

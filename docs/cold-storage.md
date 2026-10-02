@@ -10,7 +10,15 @@ User decisions:
 - **Hard requirement:** with `cold_storage_dir` empty (the default), behavior is byte-for-byte what it is today.
 - **Drive identity:** a random-ID marker on the drive must match an ID in config. If it's missing or mismatched, cold storage is unavailable and nothing is ever written there. This catches an unmounted mountpoint or the wrong drive at the same path.
 
-Status: design plan, not yet implemented.
+Status: implemented on branch `feature/cold-storage`. User-facing docs: [API](api/lemonade.md#cold-storage), [CLI](guide/cli.md#options-for-cold-storage), [config](guide/configuration/README.md).
+
+Differences from the plan below, decided during implementation:
+- The adopt endpoint is `POST /internal/cold-storage/adopt`, so it gets the existing admin-key gate for `/internal/*` routes.
+- Restoring a cold model through `/pull` or a load returns as soon as the files are back; it does not also run a remote update check. Pull again to update.
+- An unavailable drive is HTTP 503 (`cold_storage_unavailable`) everywhere.
+- A model whose main file is the *same file* another downloaded model uses can't be frozen (moving it would break the other model).
+- Lemonade only moves `refs/` and `snapshots/` (symlinks dereferenced); `blobs/` is skipped.
+- Desktop UI: the snowflake shows only on downloaded, unloaded rows; cold rows get a sun (move back), play (move back and load), and delete. The Download Manager hides pause for moves, and cancelling a move never deletes files.
 
 Note: AGENTS.md says UI changes are handled by core maintainers. Phase 3 is scoped so it can be split into a separate PR.
 

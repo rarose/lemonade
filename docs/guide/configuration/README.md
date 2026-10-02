@@ -51,6 +51,8 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
   "auto_update_models": false,
   "broadcast": true,
   "cloud_providers": [],
+  "cold_storage_dir": "",
+  "cold_storage_id": "",
   "config_version": 2,
   "ctx_size": -1,
   "default_model_source": "huggingface",
@@ -211,6 +213,8 @@ When `lemond` starts, effective configuration is resolved by deep-merging settin
 | `auto_evict_threshold_pct` | number | 0.90 | Global VRAM fraction at which pressure eviction is evaluated. Must be greater than 0 and at most 1.0; `0.90` means 90%. |
 | `broadcast` | bool | true | Enable or disable UDP broadcasting for server discovery |
 | `extra_models_dir` | string | "" | Secondary directory recursively scanned for GGUF model files. Empty disables extra discovery; existing paths must be readable by `lemond`. Top-level `chat`, `embeddings`, and `reranking` directories select how models run, see [Model Management](../../embeddable/models.md) |
+| `cold_storage_dir` | string | "" | Directory on a larger, slower disk that downloaded models can be moved to and back from (`lemonade freeze` / `lemonade thaw`). Empty disables cold storage. Must be an absolute path outside the models directory. Setting it writes a marker file there; see [Cold storage](../../api/lemonade.md#cold-storage) |
+| `cold_storage_id` | string | "" | Identity of the cold storage drive, written automatically when `cold_storage_dir` is set or adopted. Leave it to Lemonade |
 | `models_dir` | string | "auto" | Directory for cached model files. `"auto"` follows `HF_HUB_CACHE` / `HF_HOME` / platform default |
 | `ctx_size` | int | -1 | Default context size for LLM models. Use `-1` for auto-resolution: the server computes the largest context that fits in available device memory using GGUF architecture metadata. Use a positive integer to set an explicit size. |
 | `default_model_source` | string | "huggingface" | Remote registry used to pull checkpoints when a request does not name one (`huggingface` or `modelscope`). Explicit `--source`, a `source`/`registry_source` field, or a provider URL always overrides it. |

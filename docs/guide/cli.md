@@ -53,6 +53,9 @@ The `lemonade` CLI is the primary tool for interacting with Lemonade Server from
 | `alias list` | List all active model alias bindings. |
 | `import JSON_FILE`  | Import a model from a JSON configuration file. See command options [below](#options-for-import). |
 | `delete MODEL_NAME` | Delete a model and its files from local storage. |
+| `freeze MODEL_NAME` | Move a downloaded model to cold storage. Requires `cold_storage_dir`; see [below](#options-for-cold-storage). |
+| `thaw MODEL_NAME`   | Move a model back from cold storage. Loading a cold model does this automatically. |
+| `cold-storage status\|adopt` | Show whether the cold storage drive is available, or adopt the drive currently mounted there. See command options [below](#options-for-cold-storage). |
 | `load MODEL_NAME`   | Load a model for inference. See command options [below](#options-for-load). |
 | `unload [MODEL_NAME]` | Unload a model. If no model name is provided, unload all loaded models. |
 | `pin MODEL_NAME`    | Pin a loaded model to prevent auto-eviction. See options [below](#options-for-pin-and-unpin). |
@@ -521,6 +524,25 @@ lemonade pin Qwen3-0.6B-GGUF
 # Unpin a model to allow it to be evicted when slots are full
 lemonade unpin Qwen3-0.6B-GGUF
 ```
+
+## Options for cold-storage
+
+Cold storage moves downloaded models to a larger, slower disk (a NAS share or a big USB drive) and back. It is off until you point it at a directory:
+
+```bash
+lemonade config set cold_storage_dir=/mnt/backup/lemonade-cold
+lemonade freeze Qwen3-Coder-30B-A3B-Instruct-GGUF
+lemonade list --downloaded      # frozen models show "Cold"
+lemonade run Qwen3-Coder-30B-A3B-Instruct-GGUF   # moves it back first
+```
+
+Setting `cold_storage_dir` writes a small marker file to that directory. Lemonade only moves files to or from the directory while that marker is present and matches, so an unmounted drive or a different drive at the same path is never written to. `lemonade list` shows `Cold (offline)` for models whose drive is unavailable.
+
+| Command | Description |
+|---------|-------------|
+| `cold-storage status` | Show the cold storage directory and whether it is available (and why not). |
+| `cold-storage adopt` | Use the drive currently mounted at `cold_storage_dir`, e.g. after replacing or re-formatting it. Models frozen to another drive show as not downloaded until that drive is adopted again. |
+| `cold-storage adopt --create-marker` | Same, but initialize the directory as a new cold storage drive if it has no marker file. |
 
 ## Options for run
 

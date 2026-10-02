@@ -266,6 +266,9 @@ class EndpointTests(ServerTestBase):
             "images/generations",
             "install",
             "uninstall",
+            "freeze",
+            "thaw",
+            "cold-storage/status",
         ]
 
         session = requests.Session()
@@ -3009,6 +3012,30 @@ class EndpointTests(ServerTestBase):
         self.assertEqual(response.status_code, 422)
 
         print("[OK] 422 returned for deleting non-existent model")
+
+    def test_017b_cold_storage_disabled_by_default(self):
+        """Without cold_storage_dir, cold storage endpoints refuse and /models is unchanged."""
+        status = requests.get(
+            f"{self.base_url}/cold-storage/status", timeout=TIMEOUT_DEFAULT
+        )
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json()["enabled"])
+
+        for endpoint in ["freeze", "thaw"]:
+            response = requests.post(
+                f"{self.base_url}/{endpoint}",
+                json={"model_name": ENDPOINT_TEST_MODEL},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["code"], "cold_storage_disabled")
+
+        models = requests.get(
+            f"{self.base_url}/models?show_all=true", timeout=TIMEOUT_DEFAULT
+        ).json()["data"]
+        self.assertFalse(any("cold" in model for model in models))
+
+        print("[OK] Cold storage endpoints are inert when cold_storage_dir is empty")
 
     def test_018_system_info(self):
         """Test the /system-info endpoint returns required fields."""

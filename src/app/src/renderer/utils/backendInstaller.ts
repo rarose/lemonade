@@ -467,6 +467,98 @@ export async function deleteModel(modelName: string): Promise<void> {
   window.dispatchEvent(new CustomEvent('modelsUpdated'));
 }
 
+export interface ColdStorageStatus {
+  enabled: boolean;
+  available: boolean;
+  reason: string;
+  dir: string;
+  message?: string;
+  free_bytes?: number;
+}
+
+export async function fetchColdStorageStatus(refresh = false): Promise<ColdStorageStatus | null> {
+  try {
+    const response = await serverFetch(`/cold-storage/status${refresh ? '?refresh=true' : ''}`, { cache: 'no-store' });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function adoptColdStorage(createMarker: boolean): Promise<ColdStorageStatus> {
+  const response = await serverFetch('/internal/cold-storage/adopt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ create_marker: createMarker }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(extractServerErrorMessage(errorText, response.statusText));
+  }
+  window.dispatchEvent(new CustomEvent('modelsUpdated'));
+  return response.json();
+}
+
+/**
+ * Move a downloaded model to cold storage, tracked in the Download Manager.
+ * Dispatches `modelsUpdated` when the move finishes.
+ */
+export async function freezeModel(modelName: string): Promise<void> {
+  const downloadId = downloadTracker.getStableDownloadId(modelName, 'cold');
+  downloadTracker.startDownload(modelName, new AbortController(), 'cold');
+  downloadTracker.startServerPolling();
+  window.dispatchEvent(new CustomEvent('download:started', { detail: { modelName } }));
+
+  try {
+    const response = await serverFetch('/freeze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_name: modelName, stream: true, subscribe: false }),
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(extractServerErrorMessage(errorText, response.statusText));
+    }
+    downloadTracker.applyServerDownload(await response.json());
+
+    // Match on the job id only: a recent pull of the same model leaves a
+    // terminal "model:" row that must not be mistaken for this move.
+    let sawJob = true;
+    let missing = 0;
+    while (true) {
+      const snapshot = (await downloadTracker.hydrateFromServer({ throwOnError: true }))
+        .find(item => item.id === downloadId);
+      if (!snapshot) {
+        if (sawJob && ++missing >= 10) break;
+      } else {
+        sawJob = true;
+        missing = 0;
+        const stopped = snapshot.running !== true;
+        if (stopped && snapshot.status === 'completed') break;
+        if (stopped && snapshot.status === 'cancelled') throw new DownloadAbortError('cancelled');
+        if (stopped && snapshot.status === 'error') throw new Error(snapshot.error || 'Move to cold storage failed');
+      }
+      await new Promise(resolve => setTimeout(resolve, SERVER_DOWNLOAD_POLL_INTERVAL_MS));
+    }
+    window.dispatchEvent(new CustomEvent('modelsUpdated'));
+  } catch (error) {
+    if (!(error instanceof DownloadAbortError)) {
+      downloadTracker.failDownload(downloadId, error instanceof Error ? error.message : 'Unknown error');
+    }
+    throw error;
+  }
+}
+
+/**
+ * Move a cold model back to the models directory. The server's pull path
+ * thaws cold models, so this shares the pull's Download Manager row.
+ */
+export async function thawModel(modelName: string, declaredSizeGB?: number): Promise<void> {
+  await pullModel(modelName, { declaredSizeGB });
+}
+
 /**
  * Download a model with SSE progress tracking shown in the Download Manager.
  * This is the single codepath for all model downloads via POST /pull.

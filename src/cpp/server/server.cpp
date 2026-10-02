@@ -222,6 +222,9 @@ void set_route_decision_sse_content_provider(
 }
 
 int get_http_status_from_error(const std::string& error_code) {
+    if (error_code == lemon::kColdStorageUnavailableCode) {
+        return 503;
+    }
     if (error_code == "slots_pinned_error" ||
         error_code == "router_residency_conflict") {
         return 409;
@@ -392,6 +395,7 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
 
     alias_manager_ = std::make_unique<AliasManager>(cache_dir_);
     model_manager_ = std::make_unique<ModelManager>(config_->extra_models_dir());
+    model_manager_->configure_cold_storage(config_->cold_storage_dir(), config_->cold_storage_id());
     model_manager_->set_cloud_registry(cloud_registry_.get());
     model_manager_->set_default_model_source_provider(
         [this]() { return config_->default_model_source(); });
@@ -477,8 +481,16 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
             const std::string model = params["model"].get<std::string>();
             if (!model_manager_->model_exists(model))
                 throw lemon::jobs::JobError(404, "unknown model '" + model + "'");
-            if (!model_manager_->is_model_downloaded(model))
+            const bool cold = model_manager_->is_model_cold(model);
+            if (!cold && !model_manager_->is_model_downloaded(model))
                 throw lemon::jobs::JobError(404, "model '" + model + "' is not downloaded");
+            if (cold) {
+                try {
+                    model_manager_->download_registered_model(model_manager_->get_model_info(model), true);
+                } catch (const std::exception& e) {
+                    throw lemon::jobs::JobError(503, e.what());
+                }
+            }
             auto info = model_manager_->get_model_info(model);
             nlohmann::json opt_json = nlohmann::json::parse(params.dump());
             RecipeOptions options(info.recipe, opt_json);
@@ -1343,6 +1355,18 @@ void Server::setup_routes(httplib::Server &web_server) {
         handle_delete(req, res);
     });
 
+    register_post("freeze", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_freeze(req, res);
+    });
+
+    register_post("thaw", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_thaw(req, res);
+    });
+
+    register_get("cold-storage/status", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_cold_storage_status(req, res);
+    });
+
     // Backend management endpoints
     register_post("install", [this](const httplib::Request& req, httplib::Response& res) {
         handle_install(req, res);
@@ -1400,6 +1424,9 @@ void Server::setup_routes(httplib::Server &web_server) {
     });
     web_server.Post("/internal/cleanup-cache", [this](const httplib::Request& req, httplib::Response& res) {
         handle_cleanup_cache(req, res);
+    });
+    web_server.Post("/internal/cold-storage/adopt", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_cold_storage_adopt(req, res);
     });
     web_server.Post("/internal/simulate-vram-pressure", [this](const httplib::Request& req, httplib::Response& res) {
         handle_simulate_vram_pressure(req, res);
@@ -2359,6 +2386,17 @@ nlohmann::json Server::create_model_error(const std::string& requested_model, co
     }
 
     // Case 3: Model exists and is available, but failed to load.
+    if (exception_msg.rfind(lemon::kColdStorageUnavailablePrefix, 0) == 0) {
+        error_response["error"] = {
+            {"message", exception_msg},
+            {"type", lemon::kColdStorageUnavailableCode},
+            {"param", "model"},
+            {"code", lemon::kColdStorageUnavailableCode},
+            {"requested_model", requested_model}
+        };
+        return error_response;
+    }
+
     if (exception_msg.rfind("Routing residency conflict:", 0) == 0) {
         error_response["error"] = {
             {"message", exception_msg},
@@ -3198,6 +3236,12 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
         {"components", public_components},
         {"recipe_options", info.recipe_options.to_json()},
     };
+    if (info.cold) {
+        model_json["cold"] = true;
+        if (!model_manager_->cold_storage_status().available) {
+            model_json["cold_available"] = false;
+        }
+    }
 
     // Surface the cloud provider on cloud entries so the Model Manager can
     // bucket each provider into its own sub-heading. Omitted on local models
@@ -5828,7 +5872,7 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
             return;
         }
 
-        if (config_->offline()) {
+        if (config_->offline() && !model_manager_->is_model_cold(model_name)) {
             res.status = 400;
             nlohmann::json error = {{"error", "Lemond is in offline mode, models not downloaded"}, {"code", "lemond_offline"}};
             res.set_content(error.dump(), "application/json");
@@ -6373,6 +6417,8 @@ void Server::handle_delete(const httplib::Request& req, httplib::Response& res) 
 
         LOG(INFO, "Server") << "Deleting model: " << model_name << std::endl;
 
+        cancel_and_join_download_job("cold:" + model_name);
+
         // If the model is currently loaded, unload it first to release file locks
         if (router_->is_model_loaded(model_name)) {
             LOG(INFO, "Server") << "Model is loaded, unloading before delete: " << model_name << std::endl;
@@ -6434,6 +6480,201 @@ void Server::handle_delete(const httplib::Request& req, httplib::Response& res) 
 
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
+    }
+}
+
+void Server::cancel_and_join_download_job(const std::string& id) {
+    std::shared_ptr<DownloadJob> job;
+    {
+        std::lock_guard<std::mutex> lock(downloads_mutex_);
+        auto it = download_jobs_.find(id);
+        if (it == download_jobs_.end() || !it->second->running) {
+            return;
+        }
+        job = it->second;
+        job->cancel_requested = true;
+        job->cancel_action = "cancel";
+        job->status = "cancelled";
+    }
+    join_download_job(job);
+}
+
+static void send_cold_storage_error(httplib::Response& res, const std::exception& e) {
+    nlohmann::json error = {{"error", e.what()}};
+    if (const auto* request_error = dynamic_cast<const ColdStorageRequestError*>(&e)) {
+        res.status = 400;
+        error["code"] = request_error->code();
+    } else if (dynamic_cast<const ColdStorageUnavailableError*>(&e)) {
+        res.status = 503;
+        error["code"] = kColdStorageUnavailableCode;
+    } else if (std::string(e.what()).find("Model not found") != std::string::npos) {
+        res.status = 404;
+    } else {
+        res.status = 500;
+    }
+    res.set_content(error.dump(), "application/json");
+}
+
+void Server::run_cold_storage_operation(httplib::Response& res,
+                                        const nlohmann::json& request_json,
+                                        const std::string& model_name,
+                                        const std::string& job_id,
+                                        const std::string& job_type,
+                                        std::function<void(DownloadProgressCallback)> operation) {
+    const bool stream = request_json.value("stream", false);
+    const bool subscribe = request_json.value("subscribe", true);
+    if (stream && !subscribe) {
+        auto job = start_download_job(job_id, job_type, model_name, std::move(operation));
+        nlohmann::json response;
+        {
+            std::lock_guard<std::mutex> lock(downloads_mutex_);
+            response = download_job_to_json(job);
+        }
+        res.set_content(response.dump(), "application/json");
+    } else if (stream) {
+        stream_download_operation(res, std::move(operation));
+    } else {
+        operation(nullptr);
+        nlohmann::json response = {{"status", "success"}, {"model_name", model_name}};
+        res.set_content(response.dump(), "application/json");
+    }
+}
+
+void Server::handle_freeze(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json request_json;
+    if (!parse_required_json_body(req, res, request_json)) return;
+    const std::string model_name = request_json.value("model", request_json.value("model_name", std::string()));
+    if (model_name.empty()) {
+        res.status = 400;
+        res.set_content(nlohmann::json{{"error", "'model_name' is required"}}.dump(), "application/json");
+        return;
+    }
+
+    try {
+        if (!model_manager_->cold_storage_enabled()) {
+            throw ColdStorageRequestError("cold_storage_disabled",
+                "Cold storage is not configured. Set cold_storage_dir first.");
+        }
+        const ModelInfo info = model_manager_->get_model_info(model_name);
+        const std::string reason = model_manager_->cold_freeze_eligibility(info);
+        if (!reason.empty()) {
+            throw ColdStorageRequestError("not_freezable", reason);
+        }
+        const auto status = model_manager_->cold_storage_status(true);
+        if (!status.available) {
+            throw ColdStorageUnavailableError(status.describe());
+        }
+        const std::string canonical = info.model_name;
+        if (!model_manager_->begin_cold_transfer(canonical)) {
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", "Model is already being moved"}}.dump(), "application/json");
+            return;
+        }
+
+        // With the transfer marked, new loads of this model wait for the move;
+        // exclusivity closes the window for a load that was already underway.
+        try {
+            router_->begin_exclusive();
+            if (router_->is_model_loaded(canonical)) {
+                LOG(INFO, "Server") << "Unloading " << canonical << " before moving it to cold storage" << std::endl;
+                router_->unload_model(canonical);
+            }
+            router_->end_exclusive();
+        } catch (...) {
+            router_->end_exclusive();
+            model_manager_->end_cold_transfer(canonical);
+            throw;
+        }
+
+        LOG(INFO, "Server") << "Moving to cold storage: " << model_name << std::endl;
+        // The mark is released when the last copy of the operation is destroyed,
+        // which also covers an SSE client that disconnects before it runs.
+        ModelManager* manager = model_manager_.get();
+        std::shared_ptr<void> transfer_mark(nullptr, [manager, canonical](void*) {
+            manager->end_cold_transfer(canonical);
+        });
+        auto operation = [manager, canonical, transfer_mark](DownloadProgressCallback progress_cb) {
+            manager->freeze_model(canonical, progress_cb);
+        };
+        run_cold_storage_operation(res, request_json, model_name, "cold:" + model_name, "cold", operation);
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "ERROR in handle_freeze: " << e.what() << std::endl;
+        send_cold_storage_error(res, e);
+    }
+}
+
+void Server::handle_thaw(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json request_json;
+    if (!parse_required_json_body(req, res, request_json)) return;
+    const std::string model_name = request_json.value("model", request_json.value("model_name", std::string()));
+    if (model_name.empty()) {
+        res.status = 400;
+        res.set_content(nlohmann::json{{"error", "'model_name' is required"}}.dump(), "application/json");
+        return;
+    }
+
+    try {
+        if (!model_manager_->cold_storage_enabled()) {
+            throw ColdStorageRequestError("cold_storage_disabled",
+                "Cold storage is not configured. Set cold_storage_dir first.");
+        }
+        const ModelInfo info = model_manager_->get_model_info(model_name);
+        if (!info.cold) {
+            throw ColdStorageRequestError("not_cold", "Model '" + model_name + "' is not in cold storage.");
+        }
+        LOG(INFO, "Server") << "Restoring from cold storage: " << model_name << std::endl;
+        auto operation = [this, info, model_name](DownloadProgressCallback progress_cb) {
+            if (!model_manager_->thaw_model(info, progress_cb)) {
+                throw std::runtime_error("Cold storage has no files for '" + model_name +
+                                         "'; pull the model to download it again.");
+            }
+        };
+        run_cold_storage_operation(res, request_json, model_name, "model:" + model_name, "model", operation);
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "ERROR in handle_thaw: " << e.what() << std::endl;
+        send_cold_storage_error(res, e);
+    }
+}
+
+void Server::handle_cold_storage_status(const httplib::Request& req, httplib::Response& res) {
+    const bool refresh = req.has_param("refresh") && req.get_param_value("refresh") != "false";
+    nlohmann::json status = model_manager_->cold_storage_status(refresh).to_json();
+    status["message"] = model_manager_->cold_storage_status().describe();
+    status["busy"] = model_manager_->cold_storage_busy();
+    res.set_content(status.dump(), "application/json");
+}
+
+void Server::handle_cold_storage_adopt(const httplib::Request& req, httplib::Response& res) {
+    try {
+        nlohmann::json request_json = req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        const bool create_marker = request_json.value("create_marker", false);
+        const std::string dir = config_->cold_storage_dir();
+        if (dir.empty()) {
+            throw ColdStorageRequestError("cold_storage_disabled",
+                "Cold storage is not configured. Set cold_storage_dir first.");
+        }
+        if (model_manager_->cold_storage_busy()) {
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", "A cold storage transfer is in progress"}}.dump(), "application/json");
+            return;
+        }
+        const std::string id = ColdStorage::attach(dir, create_marker);
+        if (id != config_->cold_storage_id()) {
+            auto result = config_->set({{"cold_storage_id", id}}, [this](const json& applied) {
+                apply_config_side_effects(applied);
+            });
+            if (result.contains("updated") && result["updated"].is_object()) {
+                persist_config_changes(result["updated"]);
+            }
+        }
+        LOG(INFO, "Server") << "Cold storage adopted: " << dir << std::endl;
+        res.set_content(model_manager_->cold_storage_status(true).to_json().dump(), "application/json");
+    } catch (const nlohmann::json::parse_error&) {
+        res.status = 400;
+        res.set_content(nlohmann::json{{"error", "Invalid JSON in request body"}}.dump(), "application/json");
+    } catch (const std::exception& e) {
+        LOG(ERROR, "Server") << "ERROR in handle_cold_storage_adopt: " << e.what() << std::endl;
+        send_cold_storage_error(res, e);
     }
 }
 
@@ -7143,22 +7384,35 @@ void Server::handle_config_set(const httplib::Request& req, httplib::Response& r
     try {
         auto body = nlohmann::json::parse(req.body);
 
+        const bool cold_dir_requested = body.is_object() &&
+            (body.contains("cold_storage_dir") || body.contains("cold_storage_id"));
+        if (cold_dir_requested && model_manager_->cold_storage_busy()) {
+            res.status = 409;
+            nlohmann::json error = {{"error", "A cold storage transfer is in progress; try again when it finishes"}};
+            res.set_content(error.dump(), "application/json");
+            return;
+        }
+        const std::string previous_cold_dir = config_->cold_storage_dir();
+
         auto result = config_->set(body, [this](const json& applied) {
             apply_config_side_effects(applied);
         });
 
-        if (!config_dir_.empty()) {
-            try {
-                json user_cfg = ConfigFile::load_raw(config_dir_);
-                if (result.contains("updated") && result["updated"].is_object()) {
-                    user_cfg = utils::JsonUtils::merge(user_cfg, result["updated"]);
+        if (body.is_object() && body.contains("cold_storage_dir") && !body.contains("cold_storage_id") &&
+            config_->cold_storage_dir() != previous_cold_dir) {
+            const std::string cold_id = attach_cold_storage_dir(config_->cold_storage_dir(), true);
+            if (cold_id != config_->cold_storage_id()) {
+                auto id_result = config_->set({{"cold_storage_id", cold_id}}, [this](const json& applied) {
+                    apply_config_side_effects(applied);
+                });
+                if (id_result.contains("updated") && result.contains("updated")) {
+                    result["updated"].update(id_result["updated"]);
                 }
-                json defaults = ConfigFile::get_defaults();
-                utils::JsonUtils::prune_matching(user_cfg, defaults);
-                ConfigFile::save(config_dir_, user_cfg);
-            } catch (const std::exception& e) {
-                LOG(WARNING, "Server") << "Failed to persist config.json: " << e.what() << std::endl;
             }
+        }
+
+        if (result.contains("updated") && result["updated"].is_object()) {
+            persist_config_changes(result["updated"]);
         }
 
         res.set_content(result.dump(), "application/json");
@@ -7175,6 +7429,33 @@ void Server::handle_config_set(const httplib::Request& req, httplib::Response& r
         res.status = 500;
         nlohmann::json error = {{"error", e.what()}};
         res.set_content(error.dump(), "application/json");
+    }
+}
+
+void Server::persist_config_changes(const json& updated) {
+    if (config_dir_.empty()) {
+        return;
+    }
+    try {
+        json user_cfg = ConfigFile::load_raw(config_dir_);
+        user_cfg = utils::JsonUtils::merge(user_cfg, updated);
+        json defaults = ConfigFile::get_defaults();
+        utils::JsonUtils::prune_matching(user_cfg, defaults);
+        ConfigFile::save(config_dir_, user_cfg);
+    } catch (const std::exception& e) {
+        LOG(WARNING, "Server") << "Failed to persist config.json: " << e.what() << std::endl;
+    }
+}
+
+std::string Server::attach_cold_storage_dir(const std::string& dir, bool create_marker) {
+    if (dir.empty()) {
+        return "";
+    }
+    try {
+        return ColdStorage::attach(dir, create_marker);
+    } catch (const std::exception& e) {
+        LOG(WARNING, "Server") << e.what() << std::endl;
+        return "";
     }
 }
 
@@ -7369,6 +7650,9 @@ void Server::apply_config_side_effects(const json& applied_changes) {
             std::string dir = config_->extra_models_dir();
             LOG(INFO, "Server") << "Extra models dir changed to: " << dir << std::endl;
             model_manager_->set_extra_models_dir(dir);
+        } else if (key == "cold_storage_dir" || key == "cold_storage_id") {
+            model_manager_->configure_cold_storage(config_->cold_storage_dir(),
+                                                   config_->cold_storage_id());
         } else if (key == "models_dir") {
             std::string dir = config_->models_dir();
             LOG(INFO, "Server") << "Models dir changed to: " << dir << std::endl;
@@ -7425,6 +7709,9 @@ nlohmann::json Server::download_progress_to_json(const DownloadProgress& p) {
     event_data["complete"] = p.complete;
     if (!p.error.empty()) {
         event_data["error"] = p.error;
+    }
+    if (!p.operation.empty()) {
+        event_data["operation"] = p.operation;
     }
     return event_data;
 }
@@ -7788,6 +8075,9 @@ void Server::handle_download_control(const httplib::Request& req, httplib::Respo
             }
 
             auto job = it->second;
+            if (job->type == "cold" && action == "pause") {
+                action = "cancel";
+            }
             if (action == "pause" || action == "cancel") {
                 const bool terminal = job->status == "completed" ||
                     job->status == "cancelled" ||

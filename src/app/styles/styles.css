@@ -2046,6 +2046,60 @@ footer {
     color: var(--error-color);
 }
 
+.model-action-btn.freeze-btn:hover {
+    color: #7dd3fc;
+}
+
+.model-action-btn.thaw-btn:hover {
+    color: #fbbf24;
+}
+
+.model-action-btn.freeze-btn:disabled,
+.model-action-btn.thaw-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.cold-storage-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border-left: 2px solid #7dd3fc;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 0.65rem;
+    line-height: 1.3;
+}
+
+.cold-storage-banner svg {
+    flex-shrink: 0;
+    color: #7dd3fc;
+}
+
+.cold-storage-banner-text {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.cold-storage-banner-btn {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    background: transparent;
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.6rem;
+    cursor: pointer;
+}
+
+.cold-storage-banner-btn:hover {
+    border-color: #7dd3fc;
+    color: var(--text-aaa);
+}
+
 .model-info-left {
     display: flex;
     align-items: center;
@@ -2126,6 +2180,19 @@ footer {
 
 .model-status-indicator.unsupported {
     background-color: var(--error-color);
+}
+
+/* Model files are in cold storage */
+.model-status-indicator.cold {
+    background-color: #7dd3fc;
+    box-shadow: 0 0 4px rgba(125, 211, 252, 0.5);
+}
+
+.model-status-indicator.cold.cold-unavailable {
+    background-color: transparent;
+    box-shadow: none;
+    border: 1px solid #7dd3fc;
+    box-sizing: border-box;
 }
 
 /* Model is loading (pulsing animation) */

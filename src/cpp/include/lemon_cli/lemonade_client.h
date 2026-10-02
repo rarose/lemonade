@@ -49,6 +49,8 @@ struct ModelInfo {
     std::string checkpoint;
     std::string recipe;
     bool downloaded = false;
+    bool cold = false;
+    bool cold_available = true;
     bool suggested = false;
     std::vector<std::string> labels;
     std::string download_url;
@@ -94,6 +96,9 @@ public:
     // should pass upgrade=true to force an HF update check.
     int pull_model(const nlohmann::json& model_data, const std::string& display_name = "", bool upgrade = false);
     int delete_model(const std::string& model_name) const;
+    int transfer_cold_model(const std::string& model_name, bool freeze);
+    int cold_storage_status() const;
+    int cold_storage_adopt(bool create_marker) const;
     int load_model(const std::string& model_name, const nlohmann::json& recipe_options, bool save_options = false, std::optional<bool> pinned = std::nullopt) const;
     int pin_model(const std::string& model_name, bool pinned) const;
     int unload_model(const std::string& model_name) const;

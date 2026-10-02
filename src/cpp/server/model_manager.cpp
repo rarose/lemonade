@@ -31,6 +31,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <ctime>
 #include <iomanip>
 #include <lemon/utils/aixlog.hpp>
 
@@ -673,6 +674,20 @@ static void cleanup_orphaned_blobs_under(const fs::path& path,
 }
 
 static void remove_resolved_path_or_throw(const fs::path& path,
+                                          const std::string& description);
+
+// Delete the whole resolved path, not just regular files, and clean any HF
+// symlink blobs before removing the snapshot entries.
+static void remove_variant_from_repo(const fs::path& variant_path, const fs::path& repo_path) {
+    if (!safe_exists(variant_path)) {
+        return;
+    }
+    cleanup_orphaned_blobs_under(variant_path, repo_path);
+    remove_resolved_path_or_throw(variant_path, "variant path");
+    cleanup_empty_parents(variant_path, repo_path);
+}
+
+static void remove_resolved_path_or_throw(const fs::path& path,
                                           const std::string& description) {
     if (!safe_exists(path)) {
         return;
@@ -998,7 +1013,9 @@ static GGUFFiles identify_gguf_models(
 }
 
 ModelManager::ModelManager(const std::string& extra_models_dir)
-    : extra_models_dir_(extra_models_dir) {
+    : extra_models_dir_(extra_models_dir),
+      cold_storage_(std::make_unique<ColdStorage>(
+          path_from_utf8(get_config_dir()) / "cold_storage.json")) {
     server_models_ = load_server_models();
     user_models_ = load_optional_json(get_user_models_file());
     recipe_options_ = load_optional_json(get_recipe_options_file());
@@ -2829,6 +2846,24 @@ static bool check_component_downloaded(const ModelInfo& info,
     return true;
 }
 
+// A collection is cold when it is not downloaded only because some components
+// are in cold storage, so loading it would thaw rather than download.
+static bool check_component_cold(const ModelInfo& info,
+                                 const std::map<std::string, ModelInfo>& model_map) {
+    if (info.downloaded || info.components.empty()) return false;
+    bool any_cold = false;
+    for (const auto& component_name : info.components) {
+        auto it = model_map.find(component_name);
+        if (it == model_map.end()) return false;
+        if (it->second.cold) {
+            any_cold = true;
+        } else if (!it->second.downloaded) {
+            return false;
+        }
+    }
+    return any_cold;
+}
+
 static bool has_partial_files(const fs::path& dir) {
     std::error_code ec;
     if (!safe_is_directory(dir)) return false;
@@ -3337,6 +3372,19 @@ void ModelManager::build_cache() {
         }
     }
 
+    if (cold_storage_->enabled()) {
+        for (auto& [name, info] : all_models) {
+            if (!is_model_collection_recipe(info.recipe) && !info.downloaded) {
+                info.cold = cold_storage_->is_cold(name);
+            }
+        }
+        for (auto& [name, info] : all_models) {
+            if (is_model_collection_recipe(info.recipe)) {
+                info.cold = check_component_cold(info, all_models);
+            }
+        }
+    }
+
     for (auto& [name, info] : all_models) {
         populate_model_metadata(info);
         if (info.downloaded && !backend_self_manages_downloads(info.recipe)) {
@@ -3542,6 +3590,7 @@ void ModelManager::update_model_in_cache(const std::string& model_name, bool dow
         // After a fresh download the model is up to date
         if (downloaded) {
             it->second.update_available = false;
+            it->second.cold = false;
         }
 
         // Recompute resolved_path after download
@@ -3580,6 +3629,7 @@ void ModelManager::update_model_in_cache(const std::string& model_name, bool dow
                 LOG(INFO, "ModelManager") << "Collection '" << name
                           << "' downloaded=" << new_state << " (dependent on " << model_name << ")" << std::endl;
             }
+            entry.cold = check_component_cold(entry, models_cache_);
         }
     } else {
         LOG(WARNING, "ModelManager") << "'" << model_name << "' not found in cache" << std::endl;
@@ -3605,6 +3655,7 @@ void ModelManager::remove_model_from_cache(const std::string& model_name) {
         } else {
             // Registered model - just mark as not downloaded
             it->second.downloaded = false;
+            it->second.cold = false;
             it->second.update_available = false;
             LOG(INFO, "ModelManager") << "Marked '" << model_name << "' as not downloaded" << std::endl;
         }
@@ -3624,7 +3675,7 @@ std::map<std::string, ModelInfo> ModelManager::get_downloaded_models() {
     std::lock_guard<std::mutex> lock(models_cache_mutex_);
     std::map<std::string, ModelInfo> downloaded;
     for (const auto& [name, info] : models_cache_) {
-        if (info.downloaded) {
+        if (info.downloaded || info.cold) {
             auto it = canonical_public_names_.find(name);
             const std::string& public_name = it != canonical_public_names_.end() ? it->second : name;
             ModelInfo public_info = info;
@@ -4252,6 +4303,9 @@ bool ModelManager::is_model_downloaded(const std::string& model_name) {
         : model_name;
     auto it = models_cache_.find(canonical_name);
     if (it != models_cache_.end()) {
+        if (cold_storage_->enabled() && cold_storage_->is_transferring(canonical_name)) {
+            return false;
+        }
         if (it->second.downloaded && !backend_self_manages_downloads(it->second.recipe)) {
             bool still_complete = are_required_checkpoints_complete(it->second);
             if (!still_complete) {
@@ -4269,6 +4323,10 @@ bool ModelManager::backend_self_manages_downloads(const std::string& recipe) con
 }
 
 void ModelManager::download_registered_model(const ModelInfo& info, bool do_not_upgrade, DownloadProgressCallback progress_callback) {
+    if (thaw_model(info, progress_callback)) {
+        return;
+    }
+
     // Serialize downloads per checkpoint repo. A second request for the same
     // repo (e.g. a client that timed out and retried /pull while the first
     // download is still running) must wait for the in-flight download instead
@@ -5018,6 +5076,11 @@ void ModelManager::download_model(const std::string& model_name,
         LOG(INFO, "ModelManager") << " (variant: " << variant << ")";
     }
     LOG(INFO, "ModelManager") << std::endl;
+
+    // Thawing needs no network, so it runs before the offline check.
+    if (thaw_model(model_info, progress_callback)) {
+        return;
+    }
 
     // Check if offline mode
     if (auto* cfg = RuntimeConfig::global()) {
@@ -6064,6 +6127,8 @@ void ModelManager::delete_model(const std::string& model_name) {
         return;
     }
 
+    delete_cold_copy(info);
+
     // Use resolved_path to find the model directory to delete.
     // Cancelled or interrupted downloads may not have a resolved model path yet,
     // but they can still leave resumable .partial files and manifests in the HF
@@ -6140,14 +6205,7 @@ void ModelManager::delete_model(const std::string& model_name) {
                     << " is shared with other models, deleting variant path only" << std::endl;
         std::string rpath = info.resolved_path("main");
         if (!rpath.empty()) {
-            fs::path variant_path = path_from_utf8(rpath);
-            if (safe_exists(variant_path)) {
-                // Delete the whole resolved path, not just regular files
-                // and clean any HF symlink blobs before removing the snapshot entries.
-                cleanup_orphaned_blobs_under(variant_path, model_cache_path_fs);
-                remove_resolved_path_or_throw(variant_path, "variant path");
-                cleanup_empty_parents(variant_path, model_cache_path_fs);
-            }
+            remove_variant_from_repo(path_from_utf8(rpath), model_cache_path_fs);
         }
         LOG(INFO, "ModelManager") << "✓ Deleted variant for: " << canonical_model_name << std::endl;
     }
@@ -6647,6 +6705,441 @@ void ModelManager::rebuild_public_model_aliases_locked() {
     ModelAliasMaps computed = compute_model_alias_maps(models_cache_);
     public_model_aliases_ = std::move(computed.public_model_aliases);
     canonical_public_names_ = std::move(computed.canonical_public_names);
+}
+
+// ---------------------------------------------------------------------------
+// Cold storage
+//
+// Lock order: per-repo download locks (always taken in sorted key order) ->
+// models_cache_mutex_. ColdStorage's internal mutex is a leaf and may be taken
+// under either.
+// ---------------------------------------------------------------------------
+
+static std::string cold_utc_timestamp() {
+    std::time_t now = std::time(nullptr);
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &now);
+#else
+    gmtime_r(&now, &tm);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return out.str();
+}
+
+void ModelManager::configure_cold_storage(const std::string& dir, const std::string& id) {
+    const bool was_enabled = cold_storage_->enabled();
+    cold_storage_->configure(dir, id);
+    if (!dir.empty()) {
+        LOG(INFO, "ModelManager") << "Cold storage directory: " << dir << std::endl;
+    }
+    if (was_enabled || !dir.empty()) {
+        invalidate_models_cache();
+    }
+}
+
+bool ModelManager::cold_storage_enabled() const {
+    return cold_storage_->enabled();
+}
+
+ColdStorageStatus ModelManager::cold_storage_status(bool force) {
+    return cold_storage_->status(force);
+}
+
+bool ModelManager::is_model_cold(const std::string& model_name) {
+    if (!cold_storage_->enabled()) {
+        return false;
+    }
+    try {
+        return get_model_info(model_name).cold;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool ModelManager::cold_storage_busy() const {
+    return cold_storage_->any_transfers();
+}
+
+bool ModelManager::begin_cold_transfer(const std::string& model_name) {
+    return cold_storage_->begin_transfer(resolve_model_name(model_name));
+}
+
+void ModelManager::end_cold_transfer(const std::string& model_name) {
+    cold_storage_->end_transfer(resolve_model_name(model_name));
+}
+
+std::vector<ModelManager::ColdRepo> ModelManager::cold_model_repos(const ModelInfo& info) const {
+    std::vector<ColdRepo> repos;
+    std::set<std::string> seen;
+    const std::string source = effective_registry_source(info);
+    const std::string main_repo = checkpoint_to_repo_id(info.checkpoint("main"));
+    for (const auto& [type, checkpoint] : info.checkpoints) {
+        if (type == "npu_cache") continue;
+        const std::string repo = checkpoint_to_repo_id(checkpoint);
+        if (repo.empty()) continue;
+        const std::string dir_name = repo_id_to_cache_dir_name(repo, source);
+        if (!seen.insert(dir_name).second) continue;
+        repos.push_back({source + ":" + repo, dir_name, repo == main_repo});
+    }
+    std::sort(repos.begin(), repos.end(),
+              [](const ColdRepo& a, const ColdRepo& b) { return a.lock_key < b.lock_key; });
+    return repos;
+}
+
+std::vector<std::unique_lock<std::mutex>> ModelManager::lock_model_repos(const std::vector<ColdRepo>& repos) {
+    std::vector<std::shared_ptr<std::mutex>> mutexes;
+    {
+        std::lock_guard<std::mutex> guard(download_locks_mutex_);
+        for (const auto& repo : repos) {
+            auto& slot = download_locks_[repo.lock_key];
+            if (!slot) slot = std::make_shared<std::mutex>();
+            mutexes.push_back(slot);
+        }
+    }
+    // download_locks_ never drops entries, so the mutexes outlive these locks.
+    std::vector<std::unique_lock<std::mutex>> locks;
+    for (const auto& m : mutexes) {
+        locks.emplace_back(*m);
+    }
+    return locks;
+}
+
+bool ModelManager::repo_used_by_other_hot_model(const std::string& dir_name,
+                                                const std::string& exclude_model) {
+    std::lock_guard<std::mutex> lock(models_cache_mutex_);
+    for (const auto& [name, other] : models_cache_) {
+        if (name == exclude_model || !other.downloaded || !other.source.empty()) continue;
+        for (const auto& repo : cold_model_repos(other)) {
+            if (repo.dir_name == dir_name) return true;
+        }
+    }
+    return false;
+}
+
+std::string ModelManager::cold_freeze_eligibility(const ModelInfo& info) {
+    if (!cold_storage_->enabled()) {
+        return "Cold storage is not configured. Set cold_storage_dir first.";
+    }
+    if (is_model_collection_recipe(info.recipe)) {
+        return "Collections can't be moved to cold storage; move their component models instead.";
+    }
+    const auto* desc = backends::descriptor_for(info.recipe);
+    if (backend_self_manages_downloads(info.recipe) || (desc && desc->dynamic_models)) {
+        return "Models served by the '" + info.recipe + "' backend can't be moved to cold storage.";
+    }
+    if (is_extra_model_name(info.model_name)) {
+        return "Models from extra_models_dir are managed outside Lemonade.";
+    }
+    if (!info.source.empty()) {
+        return "Locally imported models can't be moved to cold storage.";
+    }
+    if (info.cold) {
+        return "Model is already in cold storage.";
+    }
+    if (!info.downloaded) {
+        return "Model is not downloaded.";
+    }
+
+    const fs::path hot = path_from_utf8(get_hf_cache_dir()).lexically_normal();
+    std::set<std::string> repo_dirs;
+    for (const auto& repo : cold_model_repos(info)) {
+        repo_dirs.insert(repo.dir_name);
+    }
+    for (const auto& [type, path] : info.resolved_paths) {
+        if (type == "npu_cache" || path.empty()) continue;
+        const fs::path rel = path_from_utf8(path).lexically_normal().lexically_relative(hot);
+        if (rel.empty() || repo_dirs.count(path_to_utf8(*rel.begin())) == 0) {
+            return "Model files are not stored in the standard cache layout.";
+        }
+    }
+
+    const fs::path main_path = path_from_utf8(info.resolved_path("main")).lexically_normal();
+    std::lock_guard<std::mutex> lock(models_cache_mutex_);
+    for (const auto& [name, other] : models_cache_) {
+        if (name == info.model_name || !other.downloaded) continue;
+        if (!other.resolved_path("main").empty() &&
+            path_from_utf8(other.resolved_path("main")).lexically_normal() == main_path) {
+            return "Model shares its files with '" + name +
+                   "'; moving it would break that model.";
+        }
+    }
+    return "";
+}
+
+void ModelManager::set_model_cold_in_cache(const std::string& model_name, bool cold) {
+    std::lock_guard<std::mutex> lock(models_cache_mutex_);
+    if (!cache_valid_) {
+        return;
+    }
+    auto it = models_cache_.find(model_name);
+    if (it == models_cache_.end()) {
+        return;
+    }
+    it->second.cold = cold;
+    if (cold) {
+        it->second.downloaded = false;
+    }
+    for (auto& [name, entry] : models_cache_) {
+        if (!is_model_collection_recipe(entry.recipe)) continue;
+        if (std::find(entry.components.begin(), entry.components.end(), model_name) ==
+            entry.components.end()) {
+            continue;
+        }
+        entry.downloaded = check_component_downloaded(entry, models_cache_);
+        entry.cold = check_component_cold(entry, models_cache_);
+    }
+}
+
+void ModelManager::sweep_cold_staging_if_idle() {
+    // Callers hold their own transfer mark, so 1 means no other transfer owns
+    // a staging directory right now.
+    if (cold_storage_->transfer_count() > 1) {
+        return;
+    }
+    cleanup_cold_staging(path_from_utf8(get_hf_cache_dir()));
+    cleanup_cold_staging(path_from_utf8(cold_storage_->dir()));
+}
+
+namespace {
+
+struct ColdTransferMark {
+    ColdStorage& storage;
+    std::string model;
+    bool owned;
+    ~ColdTransferMark() {
+        if (owned) storage.end_transfer(model);
+    }
+};
+
+TransferProgressFn make_cold_progress(const std::string& operation,
+                                      const DownloadProgressCallback& callback) {
+    if (!callback) {
+        return nullptr;
+    }
+    return [operation, callback](const TransferProgress& t) {
+        DownloadProgress p;
+        p.operation = operation;
+        p.file = t.file;
+        p.file_index = t.file_index;
+        p.total_files = t.total_files;
+        p.bytes_downloaded = static_cast<size_t>(t.file_bytes_done);
+        p.bytes_total = static_cast<size_t>(t.file_bytes_total);
+        p.total_download_size = static_cast<size_t>(t.bytes_total);
+        p.percent = t.bytes_total > 0
+            ? static_cast<int>(std::min<std::uint64_t>(100, t.bytes_done * 100 / t.bytes_total))
+            : 0;
+        return callback(p);
+    };
+}
+
+void report_cold_complete(const std::string& operation,
+                          const DownloadProgressCallback& callback,
+                          const TransferProgress& t) {
+    if (!callback) {
+        return;
+    }
+    DownloadProgress p;
+    p.operation = operation;
+    p.file_index = t.total_files;
+    p.total_files = t.total_files;
+    p.file = t.file;
+    p.bytes_downloaded = static_cast<size_t>(t.file_bytes_total);
+    p.bytes_total = static_cast<size_t>(t.file_bytes_total);
+    p.total_download_size = static_cast<size_t>(t.bytes_total);
+    p.percent = 100;
+    p.complete = true;
+    callback(p);
+}
+
+}  // namespace
+
+void ModelManager::freeze_model(const std::string& model_name, DownloadProgressCallback progress_callback) {
+    if (!cold_storage_->enabled()) {
+        throw ColdStorageRequestError("cold_storage_disabled",
+            "Cold storage is not configured. Set cold_storage_dir first.");
+    }
+    ModelInfo info = get_model_info(model_name);
+    const std::string canonical = info.model_name;
+    const std::string reason = cold_freeze_eligibility(info);
+    if (!reason.empty()) {
+        throw ColdStorageRequestError("not_freezable", reason);
+    }
+
+    ColdTransferMark mark{*cold_storage_, canonical, cold_storage_->begin_transfer(canonical)};
+    const auto repos = cold_model_repos(info);
+    auto locks = lock_model_repos(repos);
+
+    cold_storage_->verify_or_throw();
+    resolve_all_model_paths(info);
+    if (!are_required_checkpoints_complete(info)) {
+        throw ColdStorageRequestError("not_freezable", "Model is not fully downloaded.");
+    }
+    sweep_cold_staging_if_idle();
+
+    const fs::path hot = path_from_utf8(get_hf_cache_dir());
+    const fs::path cold = path_from_utf8(cold_storage_->dir());
+
+    struct Step {
+        ColdRepo repo;
+        TransferMode mode;
+    };
+    std::vector<Step> steps;
+    ColdIndexEntry entry;
+    entry.storage_id = cold_storage_->id();
+    entry.registry_source = effective_registry_source(info);
+    entry.frozen_at = cold_utc_timestamp();
+    TransferProgress state;
+    for (const auto& repo : repos) {
+        const fs::path src = hot / repo.dir_name;
+        if (!safe_exists(src)) continue;
+        const bool shared = repo_used_by_other_hot_model(repo.dir_name, canonical);
+        steps.push_back({repo, shared ? TransferMode::Copy : TransferMode::Move});
+        entry.repos.push_back(repo.dir_name);
+        state.bytes_total += cold_transfer_bytes(src, &state.total_files);
+    }
+    entry.bytes = state.bytes_total;
+
+    LOG(INFO, "ModelManager") << "Moving " << canonical << " to cold storage ("
+                              << state.bytes_total / (1024 * 1024) << " MiB)" << std::endl;
+
+    // The index entry goes first: until the hot copy is removed the model still
+    // resolves as downloaded ("hot wins"), so a crash at any point leaves it
+    // either hot or recoverably cold.
+    cold_storage_->put(canonical, entry);
+
+    const auto progress = make_cold_progress("freeze", progress_callback);
+    const auto before_commit = [this]() { cold_storage_->verify_or_throw(); };
+    std::vector<ColdRepo> moved;
+    try {
+        for (const auto& step : steps) {
+            const fs::path src = hot / step.repo.dir_name;
+            transfer_repo(src, cold, step.mode, progress, state, before_commit);
+            if (step.mode == TransferMode::Move) {
+                moved.push_back(step.repo);
+            } else if (step.repo.is_main) {
+                remove_variant_from_repo(path_from_utf8(info.resolved_path("main")), src);
+            }
+        }
+    } catch (const std::exception& e) {
+        bool restored = true;
+        for (const auto& repo : moved) {
+            try {
+                TransferProgress ignored;
+                transfer_repo(cold / repo.dir_name, hot, TransferMode::Move, nullptr, ignored);
+            } catch (const std::exception& rollback_error) {
+                restored = false;
+                LOG(ERROR, "ModelManager") << "Could not restore " << repo.dir_name
+                    << " from cold storage: " << rollback_error.what() << std::endl;
+            }
+        }
+        if (restored) {
+            cold_storage_->erase(canonical);
+        }
+        invalidate_models_cache();
+        throw;
+    }
+
+    set_model_cold_in_cache(canonical, true);
+    report_cold_complete("freeze", progress_callback, state);
+    LOG(INFO, "ModelManager") << "Moved " << canonical << " to cold storage" << std::endl;
+}
+
+bool ModelManager::thaw_model(const ModelInfo& requested, DownloadProgressCallback progress_callback) {
+    if (!cold_storage_->enabled()) {
+        return false;
+    }
+    const std::string canonical = resolve_model_name(requested.model_name);
+    if (!cold_storage_->has_entry(canonical) && !cold_storage_->is_transferring(canonical)) {
+        return false;
+    }
+
+    ModelInfo info = get_model_info(canonical);
+    ColdTransferMark mark{*cold_storage_, canonical, cold_storage_->begin_transfer(canonical)};
+    const auto repos = cold_model_repos(info);
+    auto locks = lock_model_repos(repos);
+
+    const auto entry = cold_storage_->entry(canonical);
+    resolve_all_model_paths(info);
+    if (are_required_checkpoints_complete(info)) {
+        if (entry) {
+            delete_cold_copy(info);
+        }
+        update_model_in_cache(canonical, true);
+        return true;
+    }
+    if (!entry) {
+        return false;
+    }
+    if (entry->storage_id != cold_storage_->id()) {
+        throw ColdStorageUnavailableError("Model '" + canonical +
+            "' is stored on a different cold storage drive than the one configured.");
+    }
+    cold_storage_->verify_or_throw();
+    sweep_cold_staging_if_idle();
+
+    const fs::path hot = path_from_utf8(get_hf_cache_dir());
+    const fs::path cold = path_from_utf8(cold_storage_->dir());
+    std::vector<std::string> present;
+    TransferProgress state;
+    for (const auto& dir_name : entry->repos) {
+        if (!safe_exists(cold / dir_name)) continue;
+        present.push_back(dir_name);
+        state.bytes_total += cold_transfer_bytes(cold / dir_name, &state.total_files);
+    }
+    if (present.empty()) {
+        LOG(WARNING, "ModelManager") << "Cold storage has no files for " << canonical
+                                     << "; downloading it again instead" << std::endl;
+        cold_storage_->erase(canonical);
+        set_model_cold_in_cache(canonical, false);
+        return false;
+    }
+
+    LOG(INFO, "ModelManager") << "Restoring " << canonical << " from cold storage ("
+                              << state.bytes_total / (1024 * 1024) << " MiB)" << std::endl;
+    const auto progress = make_cold_progress("thaw", progress_callback);
+    for (const auto& dir_name : present) {
+        const TransferMode mode = cold_storage_->repo_referenced_by_others(dir_name, canonical)
+            ? TransferMode::Copy : TransferMode::Move;
+        transfer_repo(cold / dir_name, hot, mode, progress, state);
+    }
+
+    cold_storage_->erase(canonical);
+    update_model_in_cache(canonical, true);
+    report_cold_complete("thaw", progress_callback, state);
+    LOG(INFO, "ModelManager") << "Restored " << canonical << " from cold storage" << std::endl;
+    return true;
+}
+
+// Caller must hold the model's repo locks or accept racing a concurrent transfer.
+void ModelManager::delete_cold_copy(const ModelInfo& info) {
+    if (!cold_storage_->enabled()) {
+        return;
+    }
+    const std::string canonical = info.model_name;
+    const auto entry = cold_storage_->entry(canonical);
+    if (!entry) {
+        return;
+    }
+    const ColdStorageStatus status = cold_storage_->status(true);
+    if (status.available && entry->storage_id == status.id) {
+        const fs::path cold = path_from_utf8(status.dir);
+        for (const auto& dir_name : entry->repos) {
+            if (cold_storage_->repo_referenced_by_others(dir_name, canonical)) continue;
+            std::error_code ec;
+            fs::remove_all(cold / dir_name, ec);
+            if (ec) {
+                LOG(WARNING, "ModelManager") << "Could not remove " << path_to_utf8(cold / dir_name)
+                                             << ": " << ec.message() << std::endl;
+            }
+        }
+    } else {
+        LOG(WARNING, "ModelManager") << "Cold storage unavailable; leaving files for "
+            << canonical << " in " << status.dir << std::endl;
+    }
+    cold_storage_->erase(canonical);
+    set_model_cold_in_cache(canonical, false);
 }
 
 } // namespace lemon

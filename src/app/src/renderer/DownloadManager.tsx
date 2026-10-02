@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { controlDownload, deleteModel, uninstallBackend, waitForDownloadStatus } from './utils/backendInstaller';
-import { downloadTracker } from './utils/downloadTracker';
+import { ColdOperation, DownloadKind, downloadTracker } from './utils/downloadTracker';
 
 export interface DownloadItem {
   id: string;
@@ -19,7 +19,10 @@ export interface DownloadItem {
   startTime: number;
   bytesResumed: number;  // Bytes already on disk at session start (for accurate speed)
   abortController?: AbortController;
-  downloadType?: 'model' | 'backend';
+  downloadType?: DownloadKind;
+  // Set for cold storage moves. A cancelled move leaves the original files in
+  // place, so there is nothing to clean up and no partial download to resume.
+  operation?: ColdOperation;
   // Components when this download is a collection.
   // UI uses this to explain the collection is made up of separate models.
   collectionComponents?: string[];
@@ -197,11 +200,16 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
   };
 
   const isServerDownloadId = (downloadId?: string): boolean =>
-    downloadId?.startsWith('model:') === true || downloadId?.startsWith('backend:') === true;
+    downloadId?.startsWith('model:') === true || downloadId?.startsWith('backend:') === true ||
+    downloadId?.startsWith('cold:') === true;
+
+  const isColdMove = (download: DownloadItem): boolean =>
+    download.operation !== undefined || download.downloadType === 'cold';
 
   const usesServerDownloadControl = (download: DownloadItem | undefined, downloadId?: string): boolean => {
     return download?.downloadType === 'model' ||
       download?.downloadType === 'backend' ||
+      download?.downloadType === 'cold' ||
       isServerDownloadId(download?.id ?? downloadId);
   };
 
@@ -262,6 +270,9 @@ const DownloadManager: React.FC<DownloadManagerProps> = ({ isVisible, onClose })
   };
 
   const cleanupDownloadedFiles = async (download: DownloadItem): Promise<void> => {
+    if (isColdMove(download)) {
+      return;
+    }
     if (download.downloadType === 'backend') {
       const [recipe, backend] = download.modelName.split(':');
       await uninstallBackend(recipe, backend);
@@ -620,6 +631,8 @@ Partial files may remain on disk.`);
                         </button>
                         <div className="download-item-text">
                           <span className="download-model-name">
+                            {download.operation === 'freeze' && 'Moving to cold storage: '}
+                            {download.operation === 'thaw' && 'Restoring from cold storage: '}
                             {download.collectionComponents && download.collectionComponents.length > 0
                               ? `Setting up ${getDownloadDisplayName(download.modelName)}`
                               : getDownloadDisplayName(download.modelName)}
@@ -666,20 +679,22 @@ Partial files may remain on disk.`);
                               <span className="download-speed">{formatSpeed(speed)}</span>
                             )}
                             <span className="download-eta">{eta}</span>
-                            <button
-                              className="download-action-btn pause-btn"
-                              onClick={() => handlePauseDownload(download)}
-                              title="Pause download"
-                            >
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <rect x="6" y="4" width="4" height="16"/>
-                                <rect x="14" y="4" width="4" height="16"/>
-                              </svg>
-                            </button>
+                            {!isColdMove(download) && (
+                              <button
+                                className="download-action-btn pause-btn"
+                                onClick={() => handlePauseDownload(download)}
+                                title="Pause download"
+                              >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <rect x="6" y="4" width="4" height="16"/>
+                                  <rect x="14" y="4" width="4" height="16"/>
+                                </svg>
+                              </button>
+                            )}
                             <button
                               className="download-action-btn cancel-btn"
                               onClick={() => handleCancelDownload(download)}
-                              title="Cancel download and delete files"
+                              title={isColdMove(download) ? 'Cancel move (files stay where they were)' : 'Cancel download and delete files'}
                             >
                               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <circle cx="12" cy="12" r="10"/>
@@ -733,6 +748,17 @@ Partial files may remain on disk.`);
                         {download.status === 'cancelled' && (
                           download.running === true ? (
                             <span className="download-deleting-text">Cancelling...</span>
+                          ) : isColdMove(download) ? (
+                            <button
+                              className="download-action-btn remove-btn"
+                              onClick={() => void handleRemoveDownload(download.id)}
+                              title="Remove from list"
+                            >
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <line x1="18" y1="6" x2="6" y2="18"/>
+                                <line x1="6" y1="6" x2="18" y2="18"/>
+                              </svg>
+                            </button>
                           ) : (
                             <>
                               <button

@@ -97,6 +97,13 @@ private:
     // mirroring the input shape, containing only entries that actually changed.
     void apply_config_side_effects(const json& applied_changes);
 
+    // Merges changed keys into config.json, dropping values equal to defaults.
+    void persist_config_changes(const json& updated);
+
+    // The id from dir's cold storage marker (written when create_marker is set
+    // and none exists), or "" when the directory is unavailable.
+    std::string attach_cold_storage_dir(const std::string& dir, bool create_marker);
+
     // Hot-swap a backend binary when its *_bin config value changes. Unloads
     // affected loaded models, runs install_backend (which downloads/replaces
     // when version.txt mismatches), then best-effort reloads them. Errors are
@@ -187,6 +194,17 @@ private:
     void handle_unload(const httplib::Request& req, httplib::Response& res);
     void handle_pin(const httplib::Request& req, httplib::Response& res);
     void handle_delete(const httplib::Request& req, httplib::Response& res);
+    void handle_freeze(const httplib::Request& req, httplib::Response& res);
+    void handle_thaw(const httplib::Request& req, httplib::Response& res);
+    void handle_cold_storage_status(const httplib::Request& req, httplib::Response& res);
+    void handle_cold_storage_adopt(const httplib::Request& req, httplib::Response& res);
+    void run_cold_storage_operation(httplib::Response& res,
+                                    const nlohmann::json& request_json,
+                                    const std::string& model_name,
+                                    const std::string& job_id,
+                                    const std::string& job_type,
+                                    std::function<void(DownloadProgressCallback)> operation);
+    void cancel_and_join_download_job(const std::string& id);
     void handle_cleanup_cache(const httplib::Request& req, httplib::Response& res);
     void handle_aliases_get(const httplib::Request& req, httplib::Response& res);
     void handle_aliases_add(const httplib::Request& req, httplib::Response& res);

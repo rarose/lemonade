@@ -1005,6 +1005,7 @@ set(SOURCES_CORE
     src/cpp/server/eviction_engine.cpp
     src/cpp/server/cli_parser.cpp
     src/cpp/server/cloud_provider_registry.cpp
+    src/cpp/server/cold_storage.cpp
     src/cpp/server/config_file.cpp
     src/cpp/server/directory_watcher.cpp
     src/cpp/server/alias_manager.cpp
@@ -2939,6 +2940,20 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_DOWNLOAD_STATE_TEST_SRC}")
 
     include(CTest)
     add_cpp_ci_test(ModelDownloadStateTest CI ON COMMAND test_model_download_state)
+endif()
+
+set(_COLD_STORAGE_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cold_storage.cpp"
+)
+if(BUILD_TESTING AND EXISTS "${_COLD_STORAGE_TEST_SRC}")
+    add_executable(test_cold_storage
+        test/cpp/test_cold_storage.cpp
+    )
+    target_link_libraries(test_cold_storage PRIVATE lemonade-server-core)
+    add_dependencies(test_cold_storage copy_resources)
+
+    include(CTest)
+    add_cpp_ci_test(ColdStorageTest CI ON COMMAND test_cold_storage)
 endif()
 
 

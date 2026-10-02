@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Boxes, Brain, ChevronRight, Cpu, Eye, Flame, Layers, ListOrdered, Settings, SlidersHorizontal, Sparkles, SquareCode, Store, User, Wrench, XIcon } from './components/Icons';
+import { Boxes, Brain, ChevronRight, Cpu, Eye, Flame, Layers, ListOrdered, Settings, SlidersHorizontal, Snowflake, Sparkles, SquareCode, Store, Sun, User, Wrench, XIcon } from './components/Icons';
 import { ModelInfo, USER_MODEL_PREFIX } from './utils/modelData';
 import { CANONICAL_PREFIXES, getModelDisplayName } from './utils/modelDisplayName';
 import { ToastContainer, useToast } from './Toast';
 import { useConfirmDialog } from './ConfirmDialog';
 import { serverFetch } from './utils/serverConfig';
-import { pullModel, DownloadAbortError, ensureModelReady, deleteModel, ensureBackendForRecipe, installBackend } from './utils/backendInstaller';
+import { pullModel, DownloadAbortError, ensureModelReady, deleteModel, ensureBackendForRecipe, installBackend, freezeModel, thawModel, fetchColdStorageStatus, adoptColdStorage } from './utils/backendInstaller';
+import type { ColdStorageStatus } from './utils/backendInstaller';
 import { fetchSystemInfoData, BackendInfo } from './utils/systemData';
 import type { ModelRegistrationData } from './utils/backendInstaller';
 import { downloadTracker } from './utils/downloadTracker';
@@ -432,6 +433,18 @@ const [searchQuery, setSearchQuery] = useState('');
   const { toasts, removeToast, showError, showSuccess, showWarning } = useToast();
   const { confirm, ConfirmDialog } = useConfirmDialog();
 
+  const [coldStorage, setColdStorage] = useState<ColdStorageStatus | null>(null);
+  const coldStorageEnabled = coldStorage?.enabled === true;
+
+  useEffect(() => {
+    const refreshColdStorage = () => {
+      void fetchColdStorageStatus().then(setColdStorage);
+    };
+    refreshColdStorage();
+    window.addEventListener('modelsUpdated', refreshColdStorage);
+    return () => window.removeEventListener('modelsUpdated', refreshColdStorage);
+  }, []);
+
   useEffect(() => {
     const loadModelManagerSettings = async () => {
       try {
@@ -604,7 +617,9 @@ const [searchQuery, setSearchQuery] = useState('');
 
     // Filter by downloaded status
     if (showDownloadedOnly) {
-      filtered = filtered.filter(model => isModelEffectivelyDownloaded(model.name, modelsData[model.name], modelsData));
+      filtered = filtered.filter(model =>
+        isModelEffectivelyDownloaded(model.name, modelsData[model.name], modelsData) ||
+        modelsData[model.name]?.cold === true);
     }
 
     // Filter by search query
@@ -1868,6 +1883,7 @@ const [searchQuery, setSearchQuery] = useState('');
     const isDownloaded = isModelEffectivelyDownloaded(modelName, info, modelsData);
     const isLoaded = isModelEffectivelyLoaded(modelName, info, modelsData, loadedModels);
     const isLoading = loadingModels.has(modelName);
+    const isCold = !isDownloaded && info?.cold === true;
 
     let statusClass = 'not-downloaded';
     let statusTitle = 'Not downloaded';
@@ -1881,9 +1897,14 @@ const [searchQuery, setSearchQuery] = useState('');
     } else if (isDownloaded) {
       statusClass = 'available';
       statusTitle = 'Available locally';
+    } else if (isCold) {
+      statusClass = info?.cold_available === false ? 'cold cold-unavailable' : 'cold';
+      statusTitle = info?.cold_available === false
+        ? 'In cold storage, but the cold storage drive is unavailable'
+        : 'In cold storage (moved back automatically when loaded)';
     }
 
-    return { isDownloaded, isLoaded, isLoading, statusClass, statusTitle };
+    return { isDownloaded, isLoaded, isLoading, isCold, statusClass, statusTitle };
   };
 
   const renderLoadOptionsButton = (modelName: string) => (
@@ -1959,8 +1980,84 @@ const [searchQuery, setSearchQuery] = useState('');
     );
   };
 
+  const canFreezeModel = (modelName: string, info: ModelInfo | undefined): boolean => {
+    if (!coldStorageEnabled || !info) return false;
+    if (isCollectionModel(info) || info.recipe === 'cloud' || info.recipe === 'flm') return false;
+    // Only registry-downloaded models live in the models cache; extra_models_dir,
+    // local imports, and uploads stay where the user put them.
+    return !info.source || info.source === 'huggingface' || info.source === 'modelscope';
+  };
+
+  const handleFreezeModel = async (modelName: string) => {
+    setHoveredModel(null);
+    const displayName = getModelDisplayName(modelName);
+    const confirmed = await confirm({
+      title: 'Move to Cold Storage',
+      message: `Move "${displayName}" to cold storage at ${coldStorage?.dir ?? 'the cold storage directory'}? ` +
+        'It stays listed and is moved back automatically the next time it is loaded.',
+      confirmText: 'Move',
+      cancelText: 'Cancel',
+    });
+    if (!confirmed) return;
+
+    try {
+      await freezeModel(modelName);
+      showSuccess(`"${displayName}" moved to cold storage.`);
+      await fetchCurrentLoadedModel();
+    } catch (error) {
+      if (error instanceof DownloadAbortError) return;
+      showError('Failed to move model to cold storage: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const handleThawModel = async (modelName: string) => {
+    setHoveredModel(null);
+    const displayName = getModelDisplayName(modelName);
+    try {
+      await thawModel(modelName, modelsData[modelName]?.size);
+      showSuccess(`"${displayName}" moved back from cold storage.`);
+    } catch (error) {
+      if (error instanceof DownloadAbortError) return;
+      showError('Failed to move model back from cold storage: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const handleAdoptColdStorage = async () => {
+    const confirmed = await confirm({
+      title: 'Use This Drive for Cold Storage',
+      message: `Use the drive currently at ${coldStorage?.dir} as cold storage? ` +
+        'Models moved to the previous drive will show as not downloaded until that drive is adopted again.',
+      confirmText: 'Use This Drive',
+      cancelText: 'Cancel',
+    });
+    if (!confirmed) return;
+    try {
+      setColdStorage(await adoptColdStorage(coldStorage?.reason === 'marker_missing'));
+    } catch (error) {
+      showError('Failed to adopt cold storage: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+  };
+
+  const renderColdStorageBanner = () => {
+    if (!coldStorage?.enabled || coldStorage.available) return null;
+    const canAdopt = ['marker_missing', 'id_mismatch', 'not_initialized'].includes(coldStorage.reason);
+    return (
+      <div className="cold-storage-banner" role="alert">
+        <Snowflake size={12} />
+        <span className="cold-storage-banner-text">
+          {coldStorage.message ?? `Cold storage is unavailable (${coldStorage.reason}).`}
+        </span>
+        {canAdopt && (
+          <button className="cold-storage-banner-btn" onClick={() => void handleAdoptColdStorage()}>
+            Use this drive
+          </button>
+        )}
+      </div>
+    );
+  };
+
   const renderActionButtonsContent = (modelName: string) => {
-    const { isDownloaded, isLoaded, isLoading } = getModelStatus(modelName);
+    const { isDownloaded, isLoaded, isLoading, isCold } = getModelStatus(modelName);
     const info = modelsData[modelName];
     const isUpscaling = info?.labels?.includes('upscaling');
     const hasUpdate = info?.update_available === true;
@@ -1976,9 +2073,34 @@ const [searchQuery, setSearchQuery] = useState('');
       !modelName.startsWith(USER_MODEL_PREFIX) &&
       info?.source !== 'user' && info?.source !== 'user_models' && info?.source !== 'custom';
     const canDeleteFromRow = !isCollection || !isBuiltInCollection;
+    const coldDriveMissing = info?.cold_available === false;
     return (
       <>
-        {!isDownloaded && (
+        {!isDownloaded && isCold && (
+          <>
+            <button
+              className="model-action-btn thaw-btn"
+              onClick={(e) => { e.stopPropagation(); void handleThawModel(modelName); }}
+              title={coldDriveMissing ? 'Cold storage drive unavailable' : 'Move back from cold storage'}
+              disabled={coldDriveMissing}
+            >
+              <Sun size={12} />
+            </button>
+            {!coldDriveMissing && !isUpscaling && (
+              <button
+                className="model-action-btn load-btn"
+                onClick={(e) => { e.stopPropagation(); handleLoadModel(modelName); }}
+                title="Move back from cold storage and load"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="5 3 19 12 5 21" fill="currentColor" />
+                </svg>
+              </button>
+            )}
+            {canDeleteFromRow && renderDeleteButton(modelName, isCollection ? 'Delete Omni Model' : 'Delete model')}
+          </>
+        )}
+        {!isDownloaded && !isCold && (
           <>
             <button
               className="model-action-btn download-btn"
@@ -2024,6 +2146,16 @@ const [searchQuery, setSearchQuery] = useState('');
                 <polygon points="5 3 19 12 5 21" fill="currentColor" />
               </svg>
             </button>
+            {canFreezeModel(modelName, info) && (
+              <button
+                className="model-action-btn freeze-btn"
+                onClick={(e) => { e.stopPropagation(); void handleFreezeModel(modelName); }}
+                title={coldStorage?.available ? 'Move to cold storage' : 'Cold storage drive unavailable'}
+                disabled={!coldStorage?.available || hasActiveDownloadForModel(modelName)}
+              >
+                <Snowflake size={12} />
+              </button>
+            )}
             {canDeleteFromRow && !isCloud && renderDeleteButton(modelName, isCollection ? 'Delete Omni Model' : 'Delete model')}
             {isEditableCollection && renderCustomCollectionOptionsButton(modelName)}
             {!isCloud && !isCollection && renderLoadOptionsButton(modelName)}
@@ -2385,6 +2517,8 @@ const [searchQuery, setSearchQuery] = useState('');
               )}
             </div>
           </div>
+
+          {currentView === 'models' && renderColdStorageBanner()}
 
           {currentView === 'models' && (
             <div className="loaded-model-section widget">

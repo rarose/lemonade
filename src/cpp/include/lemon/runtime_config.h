@@ -39,6 +39,8 @@ public:
     int log_max_files() const;
     void set_log_max_files_override(std::optional<int> override_val);
     std::string extra_models_dir() const;
+    std::string cold_storage_dir() const;
+    std::string cold_storage_id() const;
     bool broadcast() const;
     void set_broadcast_override(std::optional<bool> override_val);
     long global_timeout() const;
